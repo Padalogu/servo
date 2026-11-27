@@ -396,6 +396,20 @@ impl Range {
             }
         }
 
+        if start == end {
+            if start.is::<CharacterData>() {
+                return start.border_boxes(cx);
+            }
+            let start_offset = self.start_offset() as usize;
+            let count = (self.end_offset() as usize).saturating_sub(start_offset);
+            let children: Vec<DomRoot<Node>> =
+                start.children().skip(start_offset).take(count).collect();
+            return children
+                .iter()
+                .flat_map(|node| node.border_boxes(cx))
+                .collect();
+        }
+
         let document = start.owner_doc();
         let nodes: Vec<DomRoot<Node>> = {
             let unrooted_end = end.as_unrooted(cx.no_gc());

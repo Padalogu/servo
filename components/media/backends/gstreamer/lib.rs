@@ -8,6 +8,7 @@ pub mod audio_stream_reader;
 mod datachannel;
 mod device_monitor;
 pub mod media_capture;
+mod media_source_src;
 pub mod media_stream;
 mod media_stream_source;
 pub mod player;
@@ -20,7 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock, Weak};
 use std::thread;
 use std::vec::Vec;
 
@@ -72,52 +73,55 @@ impl GStreamerBackend {
         plugin_dir: PathBuf,
         plugins: &'a [T],
     ) -> Result<Box<dyn Backend>, ErrorLoadingPlugins<'a>> {
-        gstreamer::init().unwrap();
+        static GSTREAMER_GLOBAL_INIT: Once = Once::new();
+        GSTREAMER_GLOBAL_INIT.call_once(|| {
+            gstreamer::init().unwrap();
 
-        // GStreamer between 1.19.1 and 1.22.7 will not send messages like "end of stream"
-        // to GstPlayer unless there is a GLib main loop running somewhere. We should remove
-        // this workaround when we raise of required version of GStreamer.
-        // See https://github.com/servo/media/pull/393.
-        let needs_background_glib_main_loop = {
-            let (major, minor, micro, _) = gstreamer::version();
-            (major, minor, micro) >= (1, 19, 1) && (major, minor, micro) <= (1, 22, 7)
-        };
+            // GStreamer between 1.19.1 and 1.22.7 will not send messages like "end of stream"
+            // to GstPlayer unless there is a GLib main loop running somewhere. We should remove
+            // this workaround when we raise of required version of GStreamer.
+            // See https://github.com/servo/media/pull/393.
+            let needs_background_glib_main_loop = {
+                let (major, minor, micro, _) = gstreamer::version();
+                (major, minor, micro) >= (1, 19, 1) && (major, minor, micro) <= (1, 22, 7)
+            };
 
-        if needs_background_glib_main_loop {
-            BACKEND_THREAD.get_or_init(|| {
-                thread::spawn(|| glib::MainLoop::new(None, false).run());
-                true
-            });
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            // Remove the va plugins that have some issues on certain platforms.
-            // When the driver is fixed we will remove this.
-            let registry = gstreamer::Registry::get();
-            if let Some(plugin) = registry.find_plugin("va") {
-                registry.remove_plugin(&plugin);
+            if needs_background_glib_main_loop {
+                BACKEND_THREAD.get_or_init(|| {
+                    thread::spawn(|| glib::MainLoop::new(None, false).run());
+                    true
+                });
             }
-            if let Some(plugin) = registry.find_plugin("vaapi") {
-                registry.remove_plugin(&plugin);
-            }
-        }
 
-        // This is a workaround for a race condition in GStreamer. Real fix is
-        // in
-        // https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/12194
-        // . This will hold a connection to the server but it won't create
-        // streams. This happens during READY -> PAUSED.
-        #[cfg(target_os = "linux")]
-        {
-            static PULSESINK_KEEPALIVE: std::sync::OnceLock<Option<gstreamer::Element>> =
-                std::sync::OnceLock::new();
-            PULSESINK_KEEPALIVE.get_or_init(|| {
-                let sink = gstreamer::ElementFactory::make("pulsesink").build().ok()?;
-                sink.set_state(gstreamer::State::Ready).ok()?;
-                Some(sink)
-            });
-        }
+            #[cfg(target_os = "linux")]
+            {
+                // Remove the va plugins that have some issues on certain platforms.
+                // When the driver is fixed we will remove this.
+                let registry = gstreamer::Registry::get();
+                if let Some(plugin) = registry.find_plugin("va") {
+                    registry.remove_plugin(&plugin);
+                }
+                if let Some(plugin) = registry.find_plugin("vaapi") {
+                    registry.remove_plugin(&plugin);
+                }
+            }
+
+            // This is a workaround for a race condition in GStreamer. Real fix is
+            // in
+            // https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/12194
+            // . This will hold a connection to the server but it won't create
+            // streams. This happens during READY -> PAUSED.
+            #[cfg(target_os = "linux")]
+            {
+                static PULSESINK_KEEPALIVE: std::sync::OnceLock<Option<gstreamer::Element>> =
+                    std::sync::OnceLock::new();
+                PULSESINK_KEEPALIVE.get_or_init(|| {
+                    let sink = gstreamer::ElementFactory::make("pulsesink").build().ok()?;
+                    sink.set_state(gstreamer::State::Ready).ok()?;
+                    Some(sink)
+                });
+            }
+        });
 
         let mut errors = vec![];
         for plugin in plugins {
@@ -145,23 +149,25 @@ impl GStreamerBackend {
         thread::Builder::new()
             .name("GStreamerBackend ShutdownThread".to_owned())
             .spawn(move || {
-                match recvr.recv().unwrap() {
-                    BackendMsg::Shutdown {
-                        context,
-                        id,
-                        tx_ack,
-                    } => {
-                        let mut instances_ = instances_.lock().unwrap();
-                        if let Some(vec) = instances_.get_mut(&context) {
-                            vec.retain(|m| m.0 != id);
-                            if vec.is_empty() {
-                                instances_.remove(&context);
+                while let Ok(msg) = recvr.recv() {
+                    match msg {
+                        BackendMsg::Shutdown {
+                            context,
+                            id,
+                            tx_ack,
+                        } => {
+                            let mut instances_ = instances_.lock().unwrap();
+                            if let Some(vec) = instances_.get_mut(&context) {
+                                vec.retain(|m| m.0 != id);
+                                if vec.is_empty() {
+                                    instances_.remove(&context);
+                                }
                             }
-                        }
-                        // tell caller we are done removing this instance
-                        let _ = tx_ack.send(());
-                    },
-                };
+                            // tell caller we are done removing this instance
+                            let _ = tx_ack.send(());
+                        },
+                    }
+                }
             })
             .unwrap();
 
@@ -178,20 +184,31 @@ impl GStreamerBackend {
         id: &ClientContextId,
         cb: &dyn Fn(&dyn MediaInstance) -> Result<(), MediaInstanceError>,
     ) {
-        let mut instances = self.instances.lock().unwrap();
-        match instances.get_mut(id) {
-            Some(vec) => vec.retain(|(_, weak)| match weak.upgrade() {
-                Some(instance) => {
-                    if cb(&*(instance.lock().unwrap())).is_err() {
-                        warn!("Error executing media instance action");
-                    }
-                    true
+        let active_instances: Vec<Arc<Mutex<dyn MediaInstance>>> = {
+            let mut instances = self.instances.lock().unwrap();
+            match instances.get_mut(id) {
+                Some(vec) => {
+                    let mut active = Vec::with_capacity(vec.len());
+                    vec.retain(|(_, weak)| match weak.upgrade() {
+                        Some(instance) => {
+                            active.push(instance);
+                            true
+                        },
+                        None => false,
+                    });
+                    active
                 },
-                _ => false,
-            }),
-            None => {
-                warn!("Trying to exec media action on an unknown client context");
-            },
+                None => {
+                    warn!("Trying to exec media action on an unknown client context");
+                    return;
+                },
+            }
+        };
+
+        for instance in active_instances {
+            if cb(&*(instance.lock().unwrap())).is_err() {
+                warn!("Error executing media instance action");
+            }
         }
     }
 }
@@ -384,7 +401,7 @@ impl BackendDeInit for GStreamerBackend {
                     id,
                     tx_ack,
                 });
-            let _ = rx_ack.recv();
+            let _ = rx_ack.recv_timeout(std::time::Duration::from_secs(2));
         }
     }
 }

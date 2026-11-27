@@ -449,6 +449,8 @@ impl<DrawTarget: GenericDrawTarget> CanvasData<DrawTarget> {
                 .is_none_or(|rect| rect.is_empty())
             {
                 Snapshot::empty()
+            } else if read_rect == canvas_rect {
+                self.draw_target.snapshot()
             } else {
                 self.draw_target.snapshot().get_rect(read_rect)
             }

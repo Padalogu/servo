@@ -265,7 +265,7 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         // stores named in scope.
         let durability = options.durability;
         let scope = DOMStringList::new(cx, &self.global(), scope);
-        let transaction = IDBTransaction::new(cx, &self.global(), self, mode, durability, &scope);
+        let transaction = IDBTransaction::new(cx, &self.global(), self, mode, durability, &scope)?;
 
         // Step 8. Set transaction’s cleanup event loop to the current event loop.
         transaction.set_cleanup_event_loop();
@@ -371,7 +371,8 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
             auto_increment,
         };
 
-        self.get_idb_thread()
+        if self
+            .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),
                 database_name: self.name.to_string(),
@@ -379,7 +380,10 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
                 operation,
                 transaction_serial_number: transaction.get_serial_number(),
             })
-            .unwrap();
+            .is_err()
+        {
+            return Err(Error::InvalidState(None));
+        }
 
         self.object_store_names
             .safe_borrow_mut(cx.no_gc())
@@ -421,7 +425,8 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
         let operation = AsyncSchemaOperation::DeleteObjectStore {
             callback: transaction.create_abort_callback(),
         };
-        self.get_idb_thread()
+        if self
+            .get_idb_thread()
             .send(IndexedDBThreadMsg::AsyncSchemaOperation {
                 origin: self.global().origin().immutable().clone(),
                 database_name: self.name.to_string(),
@@ -429,7 +434,10 @@ impl IDBDatabaseMethods<crate::DomTypeHolder> for IDBDatabase {
                 operation,
                 transaction_serial_number: transaction.get_serial_number(),
             })
-            .unwrap();
+            .is_err()
+        {
+            return Err(Error::InvalidState(None));
+        }
 
         Ok(())
     }

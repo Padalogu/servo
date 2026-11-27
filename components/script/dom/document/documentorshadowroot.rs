@@ -32,6 +32,7 @@ use crate::dom::css::stylesheetlist::StyleSheetListOwner;
 use crate::dom::customelementregistry::CustomElementRegistry;
 use crate::dom::element::Element;
 use crate::dom::node::{self, Node};
+use crate::dom::selection::Selection;
 use crate::dom::types::{CSSStyleSheet, EventTarget, ShadowRoot};
 use crate::dom::window::Window;
 
@@ -137,6 +138,15 @@ impl DocumentOrShadowRoot {
 
     pub(crate) fn set_custom_element_registry(&self, registry: Option<&CustomElementRegistry>) {
         self.custom_element_registry.set(registry);
+    }
+
+    /// <https://w3c.github.io/selection-api/#dom-documentorshadowroot-getselection>
+    pub(crate) fn get_selection(
+        &self,
+        cx: &mut JSContext,
+        document: &Document,
+    ) -> Option<DomRoot<Selection>> {
+        document.GetSelection(cx)
     }
 
     /// Retarget the result of `elementsFromPoint` or `elementFromPoint` according to the

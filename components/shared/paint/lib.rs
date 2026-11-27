@@ -26,6 +26,7 @@ pub mod display_list;
 pub mod rendering_context;
 pub mod viewport_description;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
@@ -146,6 +147,13 @@ pub enum PaintMessage {
     GenerateImageKeysForPipeline(WebViewId, PipelineId),
     /// Perform a resource update operation.
     UpdateImages(PainterId, SmallVec<[ImageUpdate; 1]>),
+    /// Perform a video image resource update operation with an optional
+    /// backpressure acknowledgment callback reporting drained raw update bytes.
+    UpdateVideoImages(
+        PainterId,
+        SmallVec<[ImageUpdate; 1]>,
+        Option<GenericCallback<usize>>,
+    ),
     /// Pause all pipeline display list processing for the given pipeline until the
     /// following image updates have been received. This is used to ensure that canvas
     /// elements have had a chance to update their rendering and send the image update to
@@ -215,6 +223,85 @@ pub struct SerializableDisplayListPayload {
 
     #[serde(with = "serde_bytes")]
     pub spatial_tree: Vec<u8>,
+}
+
+pub const MAX_PENDING_RAW_IMAGE_UPDATE_BYTES: usize = 32 * 1024 * 1024;
+static IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PENDING_RAW_IMAGE_UPDATE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn enable_in_process_raw_image_budget() {
+    IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.store(true, Ordering::Release);
+}
+
+pub fn pending_raw_image_update_bytes() -> usize {
+    PENDING_RAW_IMAGE_UPDATE_BYTES.load(Ordering::Acquire)
+}
+
+pub fn raw_image_update_budget_exceeded() -> bool {
+    IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.load(Ordering::Acquire) &&
+        PENDING_RAW_IMAGE_UPDATE_BYTES.load(Ordering::Acquire) >=
+            MAX_PENDING_RAW_IMAGE_UPDATE_BYTES
+}
+
+pub fn count_raw_image_update_bytes(updates: &[ImageUpdate]) -> usize {
+    updates
+        .iter()
+        .filter_map(|update| match update {
+            ImageUpdate::UpdateImage(_, _, SerializableImageData::Raw(shm), _) => Some(shm.len()),
+            _ => None,
+        })
+        .sum()
+}
+
+pub fn release_raw_image_update_bytes(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let _ = PENDING_RAW_IMAGE_UPDATE_BYTES.try_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |current| Some(current.saturating_sub(bytes)),
+    );
+}
+
+fn try_reserve_raw_image_update_bytes(bytes: usize) -> bool {
+    if !IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.load(Ordering::Acquire) || bytes == 0 {
+        return true;
+    }
+    PENDING_RAW_IMAGE_UPDATE_BYTES
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            let next = current.saturating_add(bytes);
+            if current == 0 || next <= MAX_PENDING_RAW_IMAGE_UPDATE_BYTES {
+                Some(next)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
+fn filter_raw_image_updates_for_in_process_budget(
+    updates: &mut SmallVec<[ImageUpdate; 1]>,
+) -> (usize, usize) {
+    if !IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.load(Ordering::Acquire) {
+        return (0, 0);
+    }
+    let mut reserved_bytes = 0usize;
+    let mut dropped_bytes = 0usize;
+    updates.retain(|update| match update {
+        ImageUpdate::UpdateImage(_, _, SerializableImageData::Raw(shm), _) => {
+            let bytes = shm.len();
+            if try_reserve_raw_image_update_bytes(bytes) {
+                reserved_bytes = reserved_bytes.saturating_add(bytes);
+                true
+            } else {
+                dropped_bytes = dropped_bytes.saturating_add(bytes);
+                false
+            }
+        },
+        _ => true,
+    });
+    (reserved_bytes, dropped_bytes)
 }
 
 /// A mechanism to send messages from ScriptThread to the parent process' WebRender instance.
@@ -426,10 +513,43 @@ impl CrossProcessPaintApi {
     }
 
     /// Perform an image resource update operation.
-    pub fn update_images(&self, painter_id: PainterId, updates: SmallVec<[ImageUpdate; 1]>) {
+    pub fn update_images(&self, painter_id: PainterId, mut updates: SmallVec<[ImageUpdate; 1]>) {
+        let (reserved_bytes, _) = filter_raw_image_updates_for_in_process_budget(&mut updates);
+        if updates.is_empty() {
+            return;
+        }
         if let Err(e) = self.0.send(PaintMessage::UpdateImages(painter_id, updates)) {
+            release_raw_image_update_bytes(reserved_bytes);
             warn!("error sending image updates: {}", e);
         }
+    }
+
+    /// Perform a video image resource update operation with an optional backpressure
+    /// acknowledgment callback invoked when `Paint` drains the message.
+    ///
+    /// Returns `true` if the message was sent without dropping any raw `UpdateImage`
+    /// updates against the in-process budget. `AddImage` and `DeleteImage` updates are
+    /// never dropped.
+    pub fn update_video_images(
+        &self,
+        painter_id: PainterId,
+        mut updates: SmallVec<[ImageUpdate; 1]>,
+        ack: Option<GenericCallback<usize>>,
+    ) -> bool {
+        let (reserved_bytes, dropped_bytes) =
+            filter_raw_image_updates_for_in_process_budget(&mut updates);
+        if updates.is_empty() {
+            return false;
+        }
+        if let Err(e) = self
+            .0
+            .send(PaintMessage::UpdateVideoImages(painter_id, updates, ack))
+        {
+            release_raw_image_update_bytes(reserved_bytes);
+            warn!("error sending video image updates: {}", e);
+            return false;
+        }
+        dropped_bytes == 0
     }
 
     pub fn remove_unused_font_resources(
@@ -817,5 +937,211 @@ impl PinchZoomInfos {
             zoom_factor: Scale::identity(),
             rect: Rect::from_size(size),
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_image_budget_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use webrender_api::{IdNamespace, ImageDescriptorFlags, ImageFormat};
+
+    use super::*;
+
+    static BUDGET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct BudgetResetGuard(bool);
+
+    impl Drop for BudgetResetGuard {
+        fn drop(&mut self) {
+            PENDING_RAW_IMAGE_UPDATE_BYTES.store(0, Ordering::Release);
+            IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.store(self.0, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn raw_image_update_budget_caps_pending_updates_and_preserves_control_messages() {
+        let _test_lock = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BudgetResetGuard(IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.load(Ordering::Acquire));
+        PENDING_RAW_IMAGE_UPDATE_BYTES.store(0, Ordering::Release);
+        enable_in_process_raw_image_budget();
+
+        let (tx, rx) = mpsc::channel();
+        let api = CrossProcessPaintApi::dummy_with_callback(Some(Box::new(move |msg| {
+            let _ = tx.send(msg);
+        })));
+
+        let key = ImageKey::new(IdNamespace(42), 1);
+        let desc = ImageDescriptor::new(1024, 1024, ImageFormat::BGRA8, ImageDescriptorFlags::empty());
+
+        // AddImage is always delivered regardless of frame update budget.
+        let init_frame = vec![0u8; 4 * 1024 * 1024];
+        api.add_image(
+            key,
+            desc,
+            SerializableImageData::Raw(GenericSharedMemory::from_vec(init_frame)),
+            false,
+        );
+        assert_eq!(pending_raw_image_update_bytes(), 0);
+
+        // Send 120 raw frames of 1 MiB each (120 MiB total) -> capped at 32 MiB.
+        for _ in 0..120 {
+            let frame = vec![7u8; 1024 * 1024];
+            api.update_image(
+                key,
+                desc,
+                SerializableImageData::Raw(GenericSharedMemory::from_vec(frame)),
+                None,
+            );
+        }
+
+        assert_eq!(
+            pending_raw_image_update_bytes(),
+            MAX_PENDING_RAW_IMAGE_UPDATE_BYTES
+        );
+        assert!(raw_image_update_budget_exceeded());
+
+        // DeleteImage must still be delivered even while raw update budget is exhausted.
+        api.delete_image(key);
+
+        let mut raw_updates_received = 0usize;
+        let mut adds_received = 0usize;
+        let mut deletes_received = 0usize;
+        while let Ok(msg) = rx.recv_timeout(Duration::from_millis(200)) {
+            if let PaintMessage::UpdateImages(_, updates) = msg {
+                let bytes = count_raw_image_update_bytes(&updates);
+                release_raw_image_update_bytes(bytes);
+                for u in updates {
+                    match u {
+                        ImageUpdate::AddImage(..) => adds_received += 1,
+                        ImageUpdate::UpdateImage(..) => raw_updates_received += 1,
+                        ImageUpdate::DeleteImage(..) => deletes_received += 1,
+                        ImageUpdate::UpdateImageForAnimation(..) => {},
+                    }
+                }
+            }
+        }
+
+        assert_eq!(adds_received, 1);
+        assert_eq!(raw_updates_received, 32);
+        assert_eq!(deletes_received, 1);
+        assert_eq!(pending_raw_image_update_bytes(), 0);
+        assert!(!raw_image_update_budget_exceeded());
+    }
+
+    #[test]
+    fn update_video_images_ack_caps_pending_bytes_and_drains_on_ack() {
+        let _test_lock = BUDGET_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = BudgetResetGuard(IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.load(Ordering::Acquire));
+        PENDING_RAW_IMAGE_UPDATE_BYTES.store(0, Ordering::Release);
+        IN_PROCESS_RAW_IMAGE_BUDGET_ACTIVE.store(false, Ordering::Release);
+
+        let (tx, rx) = mpsc::channel();
+        let api = CrossProcessPaintApi::dummy_with_callback(Some(Box::new(move |msg| {
+            let _ = tx.send(msg);
+        })));
+
+        let pending_raw_bytes = Arc::new(AtomicUsize::new(0));
+        let ack_pending = pending_raw_bytes.clone();
+        let ack = GenericCallback::new(move |msg| {
+            if let Ok(bytes) = msg {
+                let _ = ack_pending.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(bytes))
+                });
+            }
+        })
+        .unwrap();
+
+        let try_reserve = |pending: &AtomicUsize, bytes: usize| -> bool {
+            pending
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    if current >= MAX_PENDING_RAW_IMAGE_UPDATE_BYTES {
+                        return None;
+                    }
+                    let next = current.saturating_add(bytes);
+                    if current == 0 || next <= MAX_PENDING_RAW_IMAGE_UPDATE_BYTES {
+                        Some(next)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+        };
+
+        let key = ImageKey::new(IdNamespace(42), 7);
+        let desc = ImageDescriptor::new(1024, 1024, ImageFormat::BGRA8, ImageDescriptorFlags::empty());
+
+        // AddImage is always delivered and does not consume raw UpdateImage backpressure budget.
+        let init_frame = vec![0u8; 4 * 1024 * 1024];
+        assert!(api.update_video_images(
+            key.into(),
+            [ImageUpdate::AddImage(
+                key,
+                desc,
+                SerializableImageData::Raw(GenericSharedMemory::from_vec(init_frame)),
+                false,
+            )]
+            .into(),
+            None,
+        ));
+        assert_eq!(pending_raw_bytes.load(Ordering::Acquire), 0);
+
+        // Send 64 raw frames of 1 MiB each (64 MiB total) -> capped at 32 MiB via per-renderer budget.
+        for _ in 0..64 {
+            let frame_bytes = 1024 * 1024;
+            if try_reserve(&pending_raw_bytes, frame_bytes) {
+                let frame = vec![7u8; frame_bytes];
+                assert!(api.update_video_images(
+                    key.into(),
+                    [ImageUpdate::UpdateImage(
+                        key,
+                        desc,
+                        SerializableImageData::Raw(GenericSharedMemory::from_vec(frame)),
+                        None,
+                    )]
+                    .into(),
+                    Some(ack.clone()),
+                ));
+            }
+        }
+
+        assert_eq!(
+            pending_raw_bytes.load(Ordering::Acquire),
+            MAX_PENDING_RAW_IMAGE_UPDATE_BYTES
+        );
+        assert_eq!(pending_raw_image_update_bytes(), 0);
+
+        // DeleteImage must still be delivered even while per-renderer raw update budget is exhausted.
+        assert!(api.update_video_images(
+            key.into(),
+            [ImageUpdate::DeleteImage(key)].into(),
+            None,
+        ));
+
+        let mut raw_updates_received = 0usize;
+        let mut adds_received = 0usize;
+        let mut deletes_received = 0usize;
+        while let Ok(msg) = rx.recv_timeout(Duration::from_millis(200)) {
+            if let PaintMessage::UpdateVideoImages(_, updates, maybe_ack) = msg {
+                let raw_bytes = count_raw_image_update_bytes(&updates);
+                for u in updates {
+                    match u {
+                        ImageUpdate::AddImage(..) => adds_received += 1,
+                        ImageUpdate::UpdateImage(..) => raw_updates_received += 1,
+                        ImageUpdate::DeleteImage(..) => deletes_received += 1,
+                        ImageUpdate::UpdateImageForAnimation(..) => {},
+                    }
+                }
+                if raw_bytes > 0 {
+                    maybe_ack.expect("raw UpdateImage must carry ack").send(raw_bytes).unwrap();
+                }
+            }
+        }
+
+        assert_eq!(adds_received, 1);
+        assert_eq!(raw_updates_received, 32);
+        assert_eq!(deletes_received, 1);
+        assert_eq!(pending_raw_bytes.load(Ordering::Acquire), 0);
     }
 }

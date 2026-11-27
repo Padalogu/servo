@@ -12,6 +12,10 @@ interface HTMLButtonElement : HTMLElement {
   // [CEReactions]
   // attribute Element? commandForElement;
   [CEReactions]
+  attribute Element? popoverTargetElement;
+  [CEReactions]
+  attribute DOMString popoverTargetAction;
+  [CEReactions]
            attribute boolean disabled;
   readonly attribute HTMLFormElement? form;
   [CEReactions]

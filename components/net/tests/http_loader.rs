@@ -2162,3 +2162,33 @@ fn test_stale_while_revalidate_serves_cached_and_revalidates_in_background() {
 
     let _ = server.close();
 }
+
+#[test]
+fn test_set_default_accept_includes_webp_for_images() {
+    let url = ServoUrl::parse("https://example.com/photo.webp").unwrap();
+    let mut request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .destination(Destination::Image)
+    .origin(url.origin())
+    .policy_container(Default::default())
+    .build();
+
+    net::http_loader::set_default_accept(&mut request);
+
+    let accept = request
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .expect("Destination::Image should populate Accept header");
+    assert!(
+        accept.contains("image/webp"),
+        "expected Accept header to advertise image/webp, got {accept}"
+    );
+    assert!(
+        !accept.contains("image/avif"),
+        "Accept header must not advertise unsupported image/avif, got {accept}"
+    );
+}

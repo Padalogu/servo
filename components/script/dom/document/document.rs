@@ -47,7 +47,7 @@ use net_traits::CookieSource::NonHTTP;
 use net_traits::CoreResourceMsg::{GetCookieStringForUrl, SetCookiesForUrl};
 use net_traits::image_cache::ImageCache;
 use net_traits::policy_container::PolicyContainer;
-use net_traits::pub_domains::{Site, is_pub_domain};
+use net_traits::pub_domains::{Site, is_pub_domain, is_same_site};
 use net_traits::request::{
     InsecureRequestsPolicy, PreloadId, PreloadKey, PreloadedResources, RequestBuilder,
 };
@@ -67,6 +67,7 @@ use script_bindings::reflector::reflect_dom_object_with_proto;
 use script_bindings::tasks::NonSendTaskBox;
 use script_bindings::trace::CustomTraceable;
 use script_traits::{DocumentActivity, ProgressiveWebMetricType};
+use selectors::matching::ElementSelectorFlags;
 use servo_arc::Arc;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSend;
@@ -94,6 +95,7 @@ use url::{Host, Position};
 
 use crate::css::stylesheet_loader::StylesheetContextId;
 use crate::css::stylesheet_set::StylesheetSetRef;
+use crate::dom::animation::Animation;
 use crate::dom::animationtimeline::AnimationTimeline;
 use crate::dom::attr::Attr;
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
@@ -172,9 +174,12 @@ use crate::dom::focusevent::FocusEvent;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::history::History;
+use crate::dom::html::form_controls::htmlbuttonelement::HTMLButtonElement;
+use crate::dom::html::form_controls::htmlinputelement::HTMLInputElement;
 use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::html::htmlareaelement::HTMLAreaElement;
 use crate::dom::html::htmlbaseelement::HTMLBaseElement;
+use crate::dom::html::htmlallcollection::HTMLAllCollection;
 use crate::dom::html::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlembedelement::HTMLEmbedElement;
@@ -183,7 +188,7 @@ use crate::dom::html::htmlheadelement::HTMLHeadElement;
 use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
-use crate::dom::html::htmlmediaelement::HTMLMediaElement;
+use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementTracker};
 use crate::dom::html::htmlscriptelement::{HTMLScriptElement, ScriptResult, TracedScriptResult};
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::htmldetailselement::DetailsNameGroups;
@@ -224,7 +229,7 @@ use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollingBox};
 use crate::dom::windowproxy::WindowProxy;
 use crate::dom::xpathevaluator::XPathEvaluator;
 use crate::dom::xpathexpression::XPathExpression;
-use crate::dom::{FlatTreeParent, RootedPromise, WeakRangeVec};
+use crate::dom::{FlatTreeParent, Promise, RootedPromise, WeakRangeVec};
 use crate::event_loop::document_loader::{DocumentLoader, LoadType};
 use crate::event_loop::script_thread::{ScriptThread, SharedRwLocks};
 use crate::event_loop::timers::{OneshotTimerCallback, OneshotTimers};
@@ -481,6 +486,7 @@ pub(crate) struct Document {
     scripts: MutNullableDom<HTMLCollection>,
     anchors: MutNullableDom<HTMLCollection>,
     applets: MutNullableDom<HTMLCollection>,
+    all: MutNullableDom<HTMLAllCollection>,
     /// Information about the `<iframes>` in this [`Document`].
     iframes: IFrameCollection,
     /// Shared locks used for style attributes, author-origin stylesheets, and user and
@@ -566,6 +572,12 @@ pub(crate) struct Document {
 
     /// Entry node for fullscreen.
     fullscreen_element: MutNullableDom<Element>,
+    /// <https://fullscreen.spec.whatwg.org/#top-layer>
+    top_layer_elements: DomRefCell<Vec<Dom<Element>>>,
+    /// <https://html.spec.whatwg.org/multipage/#showing-auto-popover-list>
+    showing_auto_popovers: DomRefCell<Vec<Dom<HTMLElement>>>,
+    /// <https://html.spec.whatwg.org/multipage/#popover-pointerdown-target>
+    popover_pointerdown_target: MutNullableDom<HTMLElement>,
     /// Map from ID to set of form control elements that have that ID as
     /// their 'form' content attribute. Used to reset form controls
     /// whenever any element with the same ID as the form attribute
@@ -610,6 +622,8 @@ pub(crate) struct Document {
     completely_loaded: Cell<bool>,
     /// Set of shadow roots connected to the document tree.
     shadow_roots: DomRefCell<FxHashSet<Dom<ShadowRoot>>>,
+    /// Connected HTMLInputElements whose UA shadow tree creation is deferred until reflow.
+    pending_input_shadow_tree_updates: DomRefCell<FxHashSet<Dom<HTMLInputElement>>>,
     /// Whether any of the shadow roots need the stylesheets flushed.
     shadow_roots_styles_changed: Cell<bool>,
     /// List of registered media controls.
@@ -740,6 +754,11 @@ pub(crate) struct Document {
     /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource>
     /// Active media elements that are kept alive while playing or eligible for autoplay.
     active_media_elements: DomRefCell<FxHashSet<Dom<HTMLMediaElement>>>,
+    /// All media elements associated with this document, tracked weakly for
+    /// player cap enforcement and throttle pause/resume.
+    media_elements: MediaElementTracker,
+    /// Monotonic sequence counter for media element LRU ordering.
+    media_activity_seq: Cell<u64>,
 
     /// <https://html.spec.whatwg.org/multipage/#details-name-group>
     details_name_groups: DomRefCell<Option<DetailsNameGroups>>,
@@ -927,6 +946,92 @@ impl Document {
             .remove(&Dom::from_ref(element));
     }
 
+    pub(crate) fn track_media_element(&self, element: &HTMLMediaElement) {
+        self.media_elements.track(element);
+    }
+
+    pub(crate) fn untrack_media_element(&self, element: &HTMLMediaElement) {
+        self.media_elements.untrack(element);
+    }
+
+    pub(crate) fn next_media_activity_seq(&self) -> u64 {
+        let seq = self.media_activity_seq.get().wrapping_add(1);
+        self.media_activity_seq.set(seq);
+        seq
+    }
+
+    pub(crate) fn active_media_player_count(&self) -> usize {
+        self.media_elements
+            .snapshot()
+            .into_iter()
+            .filter(|element| element.has_player())
+            .count()
+    }
+
+    pub(crate) fn evict_media_player_for_cap(
+        &self,
+        requester: &HTMLMediaElement,
+        no_gc: &NoGC,
+        allow_muted_playing: bool,
+    ) -> bool {
+        let candidates: Vec<DomRoot<HTMLMediaElement>> = self
+            .media_elements
+            .snapshot()
+            .into_iter()
+            .filter(|element| !std::ptr::eq(&**element, requester) && element.has_player())
+            .collect();
+
+        let victim = candidates
+            .iter()
+            .filter(|element| element.is_idle_for_cap())
+            .min_by_key(|element| element.last_active_seq())
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter(|element| element.is_paused_for_cap())
+                    .min_by_key(|element| element.last_active_seq())
+            })
+            .or_else(|| {
+                if allow_muted_playing {
+                    candidates
+                        .iter()
+                        .filter(|element| element.is_muted_for_cap())
+                        .min_by_key(|element| element.last_active_seq())
+                } else {
+                    None
+                }
+            });
+
+        if let Some(victim) = victim {
+            victim.release_media_player_for_cap(no_gc);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn pause_throttled_media_elements(&self) {
+        for element in self.media_elements.snapshot() {
+            element.pause_for_throttle();
+        }
+    }
+
+    pub(crate) fn resume_throttled_media_elements(&self) {
+        for element in self.media_elements.snapshot() {
+            if !element.needs_throttle_resume() {
+                continue;
+            }
+            let trusted = Trusted::new(&*element);
+            self.owner_global()
+                .task_manager()
+                .media_element_task_source()
+                .queue(task!(resume_throttled_media: move |cx| {
+                    let element = trusted.root();
+                    element.resume_from_throttle(cx);
+                }));
+        }
+    }
+
     fn clean_up_media_elements(&self, no_gc: &NoGC) {
         let media_elements: Vec<DomRoot<HTMLMediaElement>> = self
             .active_media_elements
@@ -936,6 +1041,9 @@ impl Document {
             .collect();
         self.active_media_elements.borrow_mut().clear();
         for element in &media_elements {
+            element.clean_up_on_document_unload(self, no_gc);
+        }
+        for element in self.media_elements.snapshot() {
             element.clean_up_on_document_unload(self, no_gc);
         }
     }
@@ -1319,6 +1427,110 @@ impl Document {
 
     pub(crate) fn clear_restyle_reasons(&self) {
         self.needs_restyle.set(RestyleReason::empty());
+    }
+
+    pub(crate) fn has_any_restyle_reason(&self) -> bool {
+        !self.needs_restyle.get().is_empty()
+    }
+
+    pub(crate) fn has_global_restyle_reason(&self) -> bool {
+        self.shadow_roots_styles_changed.get() ||
+            self.stylesheets_changed_since_last_reflow() ||
+            self.needs_restyle.get().intersects(
+                RestyleReason::StylesheetsChanged |
+                    RestyleReason::ThemeChanged |
+                    RestyleReason::ViewportChanged |
+                    RestyleReason::HighlightedDOMNodeChanged |
+                    RestyleReason::PaintWorkletLoaded,
+            )
+    }
+
+    pub(crate) fn has_pending_restyles(&self) -> bool {
+        !self.pending_restyles.borrow().is_empty()
+    }
+
+    fn pending_restyle_invalidates_style(el: &Element, restyle: &PendingRestyle) -> bool {
+        if !restyle.hint.is_empty() {
+            return true;
+        }
+        restyle.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.id_changed ||
+                snapshot.class_changed ||
+                snapshot.other_attributes_changed ||
+                !snapshot.changed_attrs.is_empty() ||
+                snapshot.attrs.is_some() ||
+                snapshot.state.is_some_and(|old_state| old_state != el.state())
+        })
+    }
+
+    pub(crate) fn can_serve_cached_resolved_style_for_element(&self, el: &Element) -> bool {
+        if self.has_global_restyle_reason() ||
+            !el.is_styled() ||
+            self.animation_manager().running_animation_count() > 0
+        {
+            return false;
+        }
+
+        let pending_restyles = self.pending_restyles.borrow();
+        let dirty_descendant_sensitive_flags = ElementSelectorFlags::HAS_EMPTY_SELECTOR |
+            ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR |
+            ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR_NON_SUBJECT |
+            ElementSelectorFlags::RELATIVE_SELECTOR_SEARCH_DIRECTION_ANCESTOR_SIBLING;
+        let sibling_sensitive_flags = ElementSelectorFlags::HAS_SLOW_SELECTOR |
+            ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS |
+            ElementSelectorFlags::HAS_SLOW_SELECTOR_NTH |
+            ElementSelectorFlags::HAS_SLOW_SELECTOR_NTH_OF |
+            ElementSelectorFlags::HAS_EDGE_CHILD_SELECTOR |
+            ElementSelectorFlags::RELATIVE_SELECTOR_SEARCH_DIRECTION_ANCESTOR_SIBLING;
+
+        for ancestor in el.upcast::<Node>().inclusive_ancestors(ShadowIncluding::Yes) {
+            if ancestor.assigned_slot().is_some() {
+                return false;
+            }
+            let Some(ancestor_el) = ancestor.downcast::<Element>() else {
+                continue;
+            };
+
+            if let Some(entry) = pending_restyles.get(&Dom::from_ref(ancestor_el)) {
+                if Self::pending_restyle_invalidates_style(ancestor_el, &entry.0) {
+                    return false;
+                }
+            }
+
+            let flags = ancestor_el.get_selector_flags();
+            if ancestor.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS) &&
+                flags.intersects(dirty_descendant_sensitive_flags)
+            {
+                return false;
+            }
+
+            if !pending_restyles.is_empty() {
+                if flags.intersects(sibling_sensitive_flags) {
+                    return false;
+                }
+
+                // A preceding sibling with a pending style/DOM change could match
+                // a sibling combinator (+, ~) or structural pseudo-class on this ancestor.
+                let mut steps = 0usize;
+                let mut sib = ancestor.GetPreviousSibling();
+                while let Some(prev) = sib {
+                    steps += 1;
+                    if steps > 16 {
+                        return false;
+                    }
+                    if let Some(prev_el) = prev.downcast::<Element>() {
+                        if let Some(entry) = pending_restyles.get(&Dom::from_ref(prev_el)) {
+                            if Self::pending_restyle_invalidates_style(prev_el, &entry.0) {
+                                return false;
+                            }
+                        }
+                    }
+                    sib = prev.GetPreviousSibling();
+                }
+            }
+        }
+
+        true
     }
 
     pub(crate) fn stylesheets_changed_since_last_reflow(&self) -> bool {
@@ -2531,7 +2743,7 @@ impl Document {
     }
 
     /// Step 9 of <https://html.spec.whatwg.org/multipage/#the-end>
-    fn queue_document_completion(&self, cx: &mut JSContext) {
+    fn queue_document_completion(&self, _cx: &mut JSContext) {
         // The initial about:blank document passes through
         // https://html.spec.whatwg.org/multipage/#creating-a-new-browsing-context
         // instead of the steps used by other documents.
@@ -3428,6 +3640,8 @@ impl Document {
             );
         }
 
+        self.focus_handler().flush_pending_focus_scroll(cx);
+
         let (reflow_phases, statistics) = self.window().reflow(cx, ReflowGoal::UpdateTheRendering);
         let phases = phases.union(reflow_phases);
 
@@ -4277,6 +4491,7 @@ impl Document {
             scripts: Default::default(),
             anchors: Default::default(),
             applets: Default::default(),
+            all: Default::default(),
             iframes: IFrameCollection::new(),
             shared_style_locks,
             stylesheets: DomRefCell::new(DocumentStylesheetSet::new()),
@@ -4313,6 +4528,9 @@ impl Document {
             ignore_opens_during_unload_counter: Default::default(),
             spurious_animation_frames: Cell::new(0),
             fullscreen_element: MutNullableDom::new(None),
+            top_layer_elements: Default::default(),
+            showing_auto_popovers: Default::default(),
+            popover_pointerdown_target: MutNullableDom::new(None),
             form_id_listener_map: Default::default(),
             interactive_time: DomRefCell::new(interactive_time),
             tti_window: DomRefCell::new(InteractiveWindow::default()),
@@ -4328,6 +4546,7 @@ impl Document {
             script_and_layout_blockers: Cell::new(0),
             delayed_tasks: Default::default(),
             shadow_roots: Default::default(),
+            pending_input_shadow_tree_updates: Default::default(),
             shadow_roots_styles_changed: Cell::new(false),
             media_controls: DomRefCell::new(HashMap::new()),
             dirty_canvases: DomRefCell::new(Default::default()),
@@ -4367,6 +4586,8 @@ impl Document {
             favicon: RefCell::new(None),
             websockets: DOMTracker::new(),
             active_media_elements: Default::default(),
+            media_elements: Default::default(),
+            media_activity_seq: Cell::new(0),
             details_name_groups: Default::default(),
             protocol_handler_automation_mode: Default::default(),
             layout_animations_test_enabled: pref!(layout_animations_test_enabled),
@@ -4641,30 +4862,74 @@ impl Document {
         &self,
         name: &str,
     ) -> Fallible<Option<CrossProcessInstant>> {
+        let navigation_timing = self.navigation_timing();
+        let resource_timing = self.resource_fetch_timing();
+        let fetch_start = resource_timing
+            .as_ref()
+            .and_then(|timing| timing.fetch_start)
+            .or_else(|| navigation_timing.navigation_start.get())
+            .unwrap_or_else(|| self.window().navigation_start());
+        let domain_lookup_start = resource_timing
+            .as_ref()
+            .and_then(|timing| timing.domain_lookup_start)
+            .unwrap_or(fetch_start);
+        let domain_lookup_end = domain_lookup_start;
+        let connect_start = resource_timing
+            .as_ref()
+            .and_then(|timing| timing.connect_start)
+            .unwrap_or(domain_lookup_end);
+        let connect_end = resource_timing
+            .as_ref()
+            .and_then(|timing| timing.connect_end)
+            .unwrap_or(connect_start);
+        let request_start = resource_timing
+            .as_ref()
+            .and_then(|timing| timing.request_start)
+            .unwrap_or(connect_end);
+        let response_start = resource_timing
+            .as_ref()
+            .and_then(|timing| timing.response_start)
+            .unwrap_or(request_start);
+        let response_end = resource_timing
+            .as_ref()
+            .and_then(|timing| timing.response_end)
+            .or_else(|| {
+                (resource_timing.is_some() ||
+                    self.ready_state.get() != DocumentReadyState::Loading)
+                    .then_some(response_start)
+            });
+
         Ok(match name {
-            "unloadEventStart" => self.navigation_timing().unload_event_start.get(),
-            "unloadEventEnd" => self.navigation_timing().unload_event_end.get(),
-            "domInteractive" => self.navigation_timing().dom_interactive.get(),
-            "domContentLoadedEventStart" => self
-                .navigation_timing()
-                .dom_content_loaded_event_start
-                .get(),
-            "domContentLoadedEventEnd" => {
-                self.navigation_timing().dom_content_loaded_event_end.get()
-            },
-            "domComplete" => self.navigation_timing().dom_complete.get(),
-            "loadEventStart" => self.navigation_timing().load_event_start.get(),
-            "loadEventEnd" => self.navigation_timing().load_event_end.get(),
-            "redirectStart" | "redirectEnd" | "secureConnectionStart" | "responseEnd" => self
-                .resource_fetch_timing()
+            "navigationStart" => navigation_timing
+                .navigation_start
+                .get()
+                .or_else(|| Some(self.window().navigation_start())),
+            "unloadEventStart" => navigation_timing.unload_event_start.get(),
+            "unloadEventEnd" => navigation_timing.unload_event_end.get(),
+            "redirectStart" => resource_timing
                 .as_ref()
-                .and_then(|resource_fetch_timing| match name {
-                    "redirectStart" => resource_fetch_timing.redirect_start,
-                    "redirectEnd" => resource_fetch_timing.redirect_end,
-                    "secureConnectionStart" => resource_fetch_timing.secure_connection_start,
-                    "responseEnd" => resource_fetch_timing.response_end,
-                    _ => None,
-                }),
+                .and_then(|timing| timing.redirect_start),
+            "redirectEnd" => resource_timing
+                .as_ref()
+                .and_then(|timing| timing.redirect_end),
+            "fetchStart" => Some(fetch_start),
+            "domainLookupStart" => Some(domain_lookup_start),
+            "domainLookupEnd" => Some(domain_lookup_end),
+            "connectStart" => Some(connect_start),
+            "connectEnd" => Some(connect_end),
+            "secureConnectionStart" => resource_timing
+                .as_ref()
+                .and_then(|timing| timing.secure_connection_start),
+            "requestStart" => Some(request_start),
+            "responseStart" => Some(response_start),
+            "responseEnd" => response_end,
+            "domLoading" => navigation_timing.dom_loading.get(),
+            "domInteractive" => navigation_timing.dom_interactive.get(),
+            "domContentLoadedEventStart" => navigation_timing.dom_content_loaded_event_start.get(),
+            "domContentLoadedEventEnd" => navigation_timing.dom_content_loaded_event_end.get(),
+            "domComplete" => navigation_timing.dom_complete.get(),
+            "loadEventStart" => navigation_timing.load_event_start.get(),
+            "loadEventEnd" => navigation_timing.load_event_end.get(),
             _ => {
                 return Err(Error::Operation(Some(format!(
                     "{name} hasn't been implemented."
@@ -4926,6 +5191,194 @@ impl Document {
         self.fullscreen_element.set(element);
     }
 
+    /// <https://fullscreen.spec.whatwg.org/#add-an-element-to-the-top-layer>
+    pub(crate) fn add_to_top_layer(&self, element: &Element) {
+        let mut top_layer = self.top_layer_elements.borrow_mut();
+        if !top_layer.iter().any(|el| &**el == element) {
+            top_layer.push(Dom::from_ref(element));
+        }
+    }
+
+    /// <https://fullscreen.spec.whatwg.org/#remove-an-element-from-the-top-layer>
+    pub(crate) fn remove_from_top_layer(&self, element: &Element) {
+        self.top_layer_elements
+            .borrow_mut()
+            .retain(|el| &**el != element);
+    }
+
+    pub(crate) fn push_showing_auto_popover(&self, popover: &HTMLElement) {
+        let mut popovers = self.showing_auto_popovers.borrow_mut();
+        if !popovers.iter().any(|p| &**p == popover) {
+            popovers.push(Dom::from_ref(popover));
+        }
+    }
+
+    pub(crate) fn remove_showing_auto_popover(&self, popover: &HTMLElement) {
+        self.showing_auto_popovers
+            .borrow_mut()
+            .retain(|p| &**p != popover);
+    }
+
+    pub(crate) fn topmost_auto_popover(&self) -> Option<DomRoot<HTMLElement>> {
+        self.showing_auto_popovers
+            .borrow()
+            .last()
+            .map(|p| DomRoot::from_ref(&**p))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#topmost-popover-ancestor>
+    pub(crate) fn topmost_popover_ancestor(
+        &self,
+        new_popover_or_target: &Node,
+        invoker: Option<&HTMLElement>,
+        is_popover: bool,
+    ) -> Option<DomRoot<HTMLElement>> {
+        let auto_popovers = self.showing_auto_popovers.borrow();
+        if auto_popovers.is_empty() {
+            return None;
+        }
+        let mut best_index: Option<usize> = None;
+        let mut best_popover: Option<DomRoot<HTMLElement>> = None;
+
+        let mut check_ancestors = |start: &Node, skip_self: bool| {
+            let skip = usize::from(skip_self);
+            for ancestor in start.inclusive_ancestors(ShadowIncluding::Yes).skip(skip) {
+                let Some(html_el) = ancestor.downcast::<HTMLElement>() else {
+                    continue;
+                };
+                if let Some(pos) = auto_popovers.iter().position(|p| &**p == html_el) &&
+                    best_index.is_none_or(|best| pos > best)
+                {
+                    best_index = Some(pos);
+                    best_popover = Some(DomRoot::from_ref(html_el));
+                }
+            }
+        };
+
+        check_ancestors(new_popover_or_target, is_popover);
+        if let Some(invoker) = invoker {
+            check_ancestors(invoker.upcast::<Node>(), false);
+        }
+
+        best_popover
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#hide-all-popovers-until>
+    pub(crate) fn hide_all_popovers_until(
+        &self,
+        cx: &mut JSContext,
+        endpoint: Option<&HTMLElement>,
+        focus_previous_element: bool,
+        fire_events: bool,
+    ) {
+        if let Some(endpoint) = endpoint {
+            let contains = self
+                .showing_auto_popovers
+                .borrow()
+                .iter()
+                .any(|p| &**p == endpoint);
+            if !contains {
+                return;
+            }
+        }
+
+        loop {
+            let next_to_hide = {
+                let popovers = self.showing_auto_popovers.borrow();
+                let Some(last) = popovers.last() else {
+                    break;
+                };
+                if endpoint.is_some_and(|ep| &**last == ep) {
+                    break;
+                }
+                if let Some(ep) = endpoint &&
+                    !popovers.iter().any(|p| &**p == ep)
+                {
+                    break;
+                }
+                DomRoot::from_ref(&**last)
+            };
+
+            let _ = next_to_hide.hide_popover_without_stack_unwind(
+                cx,
+                focus_previous_element,
+                fire_events,
+                false,
+            );
+
+            if self
+                .showing_auto_popovers
+                .borrow()
+                .last()
+                .is_some_and(|last| &**last == &*next_to_hide)
+            {
+                break;
+            }
+        }
+    }
+
+    fn topmost_clicked_popover(
+        &self,
+        cx: &mut JSContext,
+        target: &Node,
+    ) -> Option<DomRoot<HTMLElement>> {
+        let mut best = self.topmost_popover_ancestor(target, None, false);
+        let auto_popovers = self.showing_auto_popovers.borrow();
+        if auto_popovers.is_empty() {
+            return best;
+        }
+        let mut best_index = best
+            .as_ref()
+            .and_then(|b| auto_popovers.iter().position(|p| &**p == &**b));
+        drop(auto_popovers);
+
+        for ancestor in target.inclusive_ancestors(ShadowIncluding::Yes) {
+            let Some(button) = ancestor.downcast::<HTMLButtonElement>() else {
+                continue;
+            };
+            if button.upcast::<Element>().disabled_state() {
+                continue;
+            }
+            let Some(popover_el) = button.popover_target_element(cx) else {
+                continue;
+            };
+            let Some(popover_html) = popover_el.downcast::<HTMLElement>() else {
+                continue;
+            };
+            let auto_popovers = self.showing_auto_popovers.borrow();
+            if let Some(pos) = auto_popovers.iter().position(|p| &**p == popover_html) &&
+                best_index.is_none_or(|b| pos > b)
+            {
+                best_index = Some(pos);
+                best = Some(DomRoot::from_ref(popover_html));
+            }
+        }
+        best
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#light-dismiss-open-popovers>
+    pub(crate) fn handle_popover_pointerdown(&self, cx: &mut JSContext, target: &Node) {
+        if self.showing_auto_popovers.borrow().is_empty() {
+            self.popover_pointerdown_target.set(None);
+            return;
+        }
+        let clicked = self.topmost_clicked_popover(cx, target);
+        self.popover_pointerdown_target.set(clicked.as_deref());
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#light-dismiss-open-popovers>
+    pub(crate) fn handle_popover_pointerup(&self, cx: &mut JSContext, target: &Node) {
+        let pointerdown_target = self.popover_pointerdown_target.get();
+        self.popover_pointerdown_target.set(None);
+        if self.showing_auto_popovers.borrow().is_empty() {
+            return;
+        }
+        let ancestor = self.topmost_clicked_popover(cx, target);
+        if ancestor == pointerdown_target {
+            self.hide_all_popovers_until(cx, ancestor.as_deref(), false, true);
+        }
+    }
+
     fn reset_form_owner_for_listeners(&self, cx: &mut JSContext, id: &Atom) {
         let map = self.form_id_listener_map.borrow();
         if let Some(listeners) = map.get(id) {
@@ -4938,11 +5391,43 @@ impl Document {
         }
     }
 
+    pub(crate) fn schedule_input_shadow_tree_update(&self, input: &HTMLInputElement) {
+        self.pending_input_shadow_tree_updates
+            .borrow_mut()
+            .insert(Dom::from_ref(input));
+    }
+
+    pub(crate) fn unschedule_input_shadow_tree_update(&self, input: &HTMLInputElement) {
+        let mut pending = self.pending_input_shadow_tree_updates.borrow_mut();
+        if !pending.is_empty() {
+            pending.remove(&Dom::from_ref(input));
+        }
+    }
+
+    pub(crate) fn flush_pending_input_shadow_trees(&self, cx: &mut JSContext) {
+        if self.pending_input_shadow_tree_updates.borrow().is_empty() {
+            return;
+        }
+        let inputs: Vec<DomRoot<HTMLInputElement>> = self
+            .pending_input_shadow_tree_updates
+            .borrow_mut()
+            .drain()
+            .map(|input| input.as_rooted())
+            .collect();
+        for input in inputs {
+            if input.upcast::<Node>().is_connected() {
+                input.flush_shadow_tree(cx);
+            }
+        }
+    }
+
     pub(crate) fn register_shadow_root(&self, shadow_root: &ShadowRoot) {
         self.shadow_roots
             .borrow_mut()
             .insert(Dom::from_ref(shadow_root));
-        self.invalidate_shadow_roots_stylesheets();
+        if shadow_root.stylesheet_count() > 0 {
+            self.invalidate_shadow_roots_stylesheets();
+        }
     }
 
     pub(crate) fn unregister_shadow_root(&self, shadow_root: &ShadowRoot) {
@@ -5133,6 +5618,7 @@ impl Document {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn advance_animation_timeline_for_testing(&self, delta: TimeDuration) {
         self.timeline.advance_specific(delta);
         let current_timeline_value = self.current_animation_timeline_value();
@@ -5196,6 +5682,7 @@ impl Document {
         node.set_flag(NodeFlags::OVERLAPS_DOCUMENT_SELECTION, false);
         node.set_flag(NodeFlags::SELECTION_INHIBITED, false);
         node.set_flag(NodeFlags::HAS_DIRTY_DESCENDANTS, false);
+        node.set_flag(NodeFlags::HAS_DIRTY_LAYOUT_DESCENDANTS, false);
     }
 
     /// An implementation of <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
@@ -5408,18 +5895,7 @@ impl Document {
     pub(crate) fn determine_the_network_partition_key(&self) -> Option<Site> {
         // Step 1. Let topLevelOrigin be environment’s top-level origin.
         // https://html.spec.whatwg.org/multipage/#concept-environment-top-level-origin
-        let top_level_origin = if self.window().is_top_level() {
-            Some(self.origin().immutable().clone())
-        } else if let Some(top_level_document) = self.window().top_level_document_if_local() {
-            Some(top_level_document.origin().immutable().clone())
-        } else if let Ok(ancestor_origins) = self.internal_ancestor_origin_objects_list.try_borrow()
-        {
-            ancestor_origins
-                .as_ref()
-                .and_then(|ancestors| ancestors.last().cloned())
-        } else {
-            None
-        };
+        let top_level_origin = self.top_level_origin_for_context();
 
         // Step 2. If topLevelOrigin is null, then set topLevelOrigin to environment’s
         // top-level creation URL’s origin.
@@ -5442,6 +5918,81 @@ impl Document {
 
         // Step 6. Return (topLevelSite, secondKey).
         Some(top_level_site)
+    }
+
+    fn top_level_origin_for_context(&self) -> Option<ImmutableOrigin> {
+        if self.window().is_top_level() {
+            Some(self.origin().immutable().clone())
+        } else if let Some(top_level_document) = self.window().top_level_document_if_local() {
+            Some(top_level_document.origin().immutable().clone())
+        } else if let Ok(ancestor_origins) = self.internal_ancestor_origin_objects_list.try_borrow()
+        {
+            ancestor_origins
+                .as_ref()
+                .and_then(|ancestors| ancestors.last().cloned())
+        } else {
+            None
+        }
+    }
+
+    /// <https://privacycg.github.io/storage-access/#has-storage-access>
+    fn has_storage_access_granted(&self) -> bool {
+        if !self.is_fully_active() || !self.origin().is_tuple() {
+            return false;
+        }
+        if self.window().is_top_level() {
+            return true;
+        }
+        if let Ok(ancestors) = self.internal_ancestor_origin_objects_list.try_borrow() &&
+            let Some(ancestors) = ancestors.as_ref() &&
+            !ancestors.is_empty() &&
+            ancestors.iter().all(|origin| origin.is_tuple())
+        {
+            return ancestors
+                .iter()
+                .all(|anc_origin| is_same_site(self.origin().immutable(), anc_origin));
+        }
+
+        // Fall back to walking WindowProxy ancestors when `internal_ancestor_origin_objects_list`
+        // is empty or contains an opaque entry (e.g., `referrerPolicy="no-referrer"` masking vs.
+        // a genuine sandboxed opaque ancestor).
+        let mut cursor = self.window().undiscarded_window_proxy();
+        let mut checked_any_ancestor = false;
+        while let Some(proxy) = cursor {
+            let Some(parent_proxy) = proxy.parent() else {
+                break;
+            };
+            checked_any_ancestor = true;
+            let parent_origin = if let Some(parent_doc) = parent_proxy.document() {
+                Some(parent_doc.origin().immutable().clone())
+            } else {
+                parent_proxy
+                    .document_origin_and_internal_ancestor_origin_objects_list()
+                    .map(|(origin, _)| origin.immutable().clone())
+            };
+            let Some(parent_origin) = parent_origin else {
+                return false;
+            };
+            if !parent_origin.is_tuple() ||
+                !is_same_site(self.origin().immutable(), &parent_origin)
+            {
+                return false;
+            }
+            cursor = Some(DomRoot::from_ref(parent_proxy));
+        }
+        if checked_any_ancestor {
+            return true;
+        }
+
+        let top_level_origin = self.top_level_origin_for_context().or_else(|| {
+            self.window()
+                .as_global_scope()
+                .top_level_creation_url()
+                .map(|url| url.origin())
+        });
+        top_level_origin.is_some_and(|top_origin| {
+            top_origin.is_tuple() && is_same_site(self.origin().immutable(), &top_origin)
+        })
     }
 
     pub(crate) fn highlight_dom_node(&self, node: Option<&Node>) {
@@ -6265,13 +6816,18 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                 let registry = if let Some(registry) = options.customElementRegistry {
                     // Step 5.3. If registry's is scoped is false and registry
                     // is not this's custom element registry, then throw a "NotSupportedError" DOMException.
-                    let this_registry = self
-                        .custom_element_registry()
-                        .expect("Document must have a custom element registry");
-                    if !registry.is_scoped() && registry != this_registry {
-                        return Err(Error::NotSupported(Some(
-                            "Imported customElementRegistry is not scoped and does not match existing registry.".into()
-                        )));
+                    if !registry.is_scoped() {
+                        let this_registry = self.custom_element_registry().or_else(|| {
+                            (self.has_browsing_context() &&
+                                !self.window_detached() &&
+                                self.window().Document() == DomRoot::from_ref(self))
+                            .then(|| self.window().CustomElements(cx))
+                        });
+                        if this_registry.as_ref() != Some(&registry) {
+                            return Err(Error::NotSupported(Some(
+                                "Imported customElementRegistry is not scoped and does not match existing registry.".into()
+                            )));
+                        }
                     }
                     Some(registry)
                 } else {
@@ -6695,6 +7251,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     fn Applets(&self, cx: &mut JSContext) -> DomRoot<HTMLCollection> {
         self.applets
             .or_init(|| HTMLCollection::always_empty(cx, &self.window, self.upcast()))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-all>
+    fn All(&self, cx: &mut JSContext) -> DomRoot<HTMLAllCollection> {
+        self.all
+            .or_init(|| HTMLAllCollection::new(cx, &self.window, self.upcast()))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-document-location>
@@ -7348,6 +7910,24 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         self.exit_fullscreen(cx)
     }
 
+    /// <https://privacycg.github.io/storage-access/#dom-document-hasstorageaccess>
+    fn HasStorageAccess(&self, cx: &mut CurrentRealm) -> RootedPromise {
+        let promise = Promise::new_in_realm(cx);
+        promise.resolve_native(cx, &self.has_storage_access_granted());
+        promise
+    }
+
+    /// <https://privacycg.github.io/storage-access/#dom-document-requeststorageaccess>
+    fn RequestStorageAccess(&self, cx: &mut CurrentRealm) -> RootedPromise {
+        let promise = Promise::new_in_realm(cx);
+        if self.has_storage_access_granted() {
+            promise.resolve_native(cx, &());
+        } else {
+            promise.reject_error(cx, Error::NotAllowed(None));
+        }
+        promise
+    }
+
     // check-tidy: no specs after this line
     // Servo only API to get an instance of the controls of a specific
     // media element matching the given id.
@@ -7468,6 +8048,13 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
     fn Timeline(&self) -> DomRoot<DocumentTimeline> {
         self.timeline.as_rooted()
+    }
+
+    /// <https://drafts.csswg.org/web-animations-1/#dom-documentorshadowroot-getanimations>
+    fn GetAnimations(&self) -> Vec<DomRoot<Animation>> {
+        self.Timeline()
+            .upcast::<AnimationTimeline>()
+            .active_animations()
     }
 }
 

@@ -75,6 +75,16 @@ pub trait LayoutElement<'dom>: Copy + Debug + Send + Sync {
     /// Set the snapshot flags on the underlying DOM object for this element.
     fn set_has_snapshot(&self);
 
+    /// Returns whether this element has descendants with deferred layout damage from a
+    /// previous style-only reflow.
+    fn has_dirty_layout_descendants(&self) -> bool;
+
+    /// Mark this element as having descendants with deferred layout damage.
+    fn set_has_dirty_layout_descendants(&self);
+
+    /// Clear the deferred layout descendants flag on this element.
+    fn unset_has_dirty_layout_descendants(&self);
+
     /// Get the [`StyleData`] for this [`LayoutElement`].
     fn style_data(self) -> Option<&'dom StyleData>;
 

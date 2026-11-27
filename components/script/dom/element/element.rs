@@ -48,6 +48,7 @@ use selectors::sink::Push;
 use servo_arc::Arc as ServoArc;
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
+use style::computed_values::visibility::T as Visibility;
 use style::context::QuirksMode;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::longhands::{
@@ -82,13 +83,16 @@ use crate::dom::RootedPromise;
 use crate::dom::accessors::AttrStrRef;
 use crate::dom::activation::Activatable;
 use crate::dom::animation::Animation;
+use crate::dom::animations::animationtimeline::AnimationTimeline;
 use crate::dom::animations::keyframeeffect::KeyframeEffect;
 use crate::dom::attr::{Attr, is_relevant_attribute};
 use crate::dom::bindings::cell::AtomicSafeBorrowMut;
+use crate::dom::bindings::codegen::Bindings::AnimatableBinding::GetAnimationsOptions;
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::{
-    ElementMethods, GetHTMLOptions, ScrollIntoViewContainer, ScrollLogicalPosition, ShadowRootInit,
+    CheckVisibilityOptions, ElementMethods, GetHTMLOptions, ScrollIntoViewContainer,
+    ScrollLogicalPosition, ShadowRootInit,
 };
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
@@ -391,19 +395,27 @@ impl Element {
         let doc = self.node.owner_document_unrooted(no_gc);
         let mut restyle = doc.ensure_pending_restyle(self);
 
-        // FIXME(bholley): I think we should probably only do this for
-        // NodeStyleDamaged, but I'm preserving existing behavior.
-        restyle.hint.insert(RestyleHint::RESTYLE_SELF);
-
         match damage {
-            NodeDamage::Style => {},
+            NodeDamage::Style => {
+                // FIXME(bholley): I think we should probably only do this for
+                // NodeStyleDamaged, but I'm preserving existing behavior.
+                restyle.hint.insert(RestyleHint::RESTYLE_SELF);
+            },
             NodeDamage::ContentOrHeritage => {
                 doc.note_dirty_element(no_gc, self);
+                if self.get_selector_flags().intersects(
+                    ElementSelectorFlags::HAS_EMPTY_SELECTOR |
+                        ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR |
+                        ElementSelectorFlags::ANCHORS_RELATIVE_SELECTOR_NON_SUBJECT,
+                ) {
+                    restyle.hint.insert(RestyleHint::RESTYLE_SELF);
+                }
                 restyle
                     .damage
                     .insert(RestyleDamage::from(LayoutDamage::DescendantHasBoxDamage));
             },
             NodeDamage::Other => {
+                restyle.hint.insert(RestyleHint::RESTYLE_SELF);
                 doc.note_dirty_element(no_gc, self);
                 restyle.damage.insert(RestyleDamage::reconstruct());
             },
@@ -1034,8 +1046,10 @@ impl Element {
     }
 
     pub(crate) fn style(&self) -> Option<ServoArc<ComputedValues>> {
-        self.owner_window()
-            .layout_reflow_deprecated(QueryMsg::StyleQuery);
+        let window = self.owner_window();
+        if !window.can_skip_reflow_for_style(self) {
+            window.layout_reflow_deprecated(QueryMsg::StyleQuery);
+        }
         self.style_without_reflow()
     }
 
@@ -2945,7 +2959,7 @@ impl Element {
     }
 
     #[inline]
-    fn get_selector_flags(&self) -> ElementSelectorFlags {
+    pub(crate) fn get_selector_flags(&self) -> ElementSelectorFlags {
         ElementSelectorFlags::from_bits_retain(self.selector_flags.load(Ordering::Relaxed))
     }
 
@@ -4780,6 +4794,14 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         //
         // If the above procedure causes an exception to be thrown, propagate the exception and
         // abort this procedure.
+        let anim_id = if let UnrestrictedDoubleOrKeyframeAnimationOptions::KeyframeAnimationOptions(
+            ref opts,
+        ) = options
+        {
+            Some(opts.id.clone())
+        } else {
+            None
+        };
         let parent_options = match options {
             UnrestrictedDoubleOrKeyframeAnimationOptions::UnrestrictedDouble(value) => {
                 UnrestrictedDoubleOrKeyframeEffectOptions::UnrestrictedDouble(value)
@@ -4802,13 +4824,69 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
             Some(Some(&timeline)),
         );
 
-        // TODO: Step 5. If options is a KeyframeAnimationOptions object, assign the value of the id member of options
+        // Step 5. If options is a KeyframeAnimationOptions object, assign the value of the id member of options
         // to animation’s id attribute.
+        if let Some(id) = anim_id {
+            animation.SetId(id);
+        }
 
-        // TODO: Step 6. Run the procedure to play an animation for animation with the auto-rewind flag set to true.
+        // Step 6. Run the procedure to play an animation for animation with the auto-rewind flag set to true.
+        animation.Play(cx);
 
         // Step 7. Return animation.
         animation
+    }
+
+    /// <https://drafts.csswg.org/web-animations-1/#dom-animatable-getanimations>
+    fn GetAnimations(&self, options: &GetAnimationsOptions) -> Vec<DomRoot<Animation>> {
+        self.owner_document()
+            .Timeline()
+            .upcast::<AnimationTimeline>()
+            .animations_for_element(self, options.subtree)
+    }
+
+    /// <https://drafts.csswg.org/cssom-view/#dom-element-checkvisibility>
+    fn CheckVisibility(&self, options: &CheckVisibilityOptions) -> bool {
+        let node = self.upcast::<Node>();
+        if !node.is_connected() {
+            return false;
+        }
+
+        let Some(style) = self.style() else {
+            return false;
+        };
+        let display = style.get_display();
+        if display.is_none() || display.is_contents() {
+            return false;
+        }
+
+        if (options.checkVisibilityCSS || options.visibilityProperty) &&
+            style.get_inherited_box().visibility != Visibility::Visible
+        {
+            return false;
+        }
+
+        let check_opacity = options.checkOpacity || options.opacityProperty;
+        let mut current = Some(DomRoot::from_ref(self));
+        while let Some(elem) = current {
+            let elem_style = if elem.upcast::<Node>() == node {
+                Some(style.clone())
+            } else {
+                elem.style_without_reflow()
+            };
+            let Some(s) = elem_style else {
+                return false;
+            };
+            if s.get_display().is_none() {
+                return false;
+            }
+            if check_opacity && s.get_effects().opacity == 0.0 {
+                return false;
+            }
+            current = elem.upcast::<Node>().GetParentElement();
+        }
+
+        true
     }
 }
 

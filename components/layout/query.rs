@@ -21,6 +21,7 @@ use layout_api::{
 use paint_api::display_list::ScrollTree;
 use script::layout_dom::ServoLayoutNode;
 use servo_arc::Arc as ServoArc;
+use servo_base::id::ScrollTreeNodeId;
 use servo_base::text::Utf32CodeUnits;
 use servo_geometry::{FastLayoutTransform, au_rect_to_f32_rect, f32_rect_to_au_rect};
 use servo_url::ServoUrl;
@@ -57,7 +58,7 @@ use crate::flow::inline::text_transform::TextTransformationIterator;
 use crate::fragment_tree::{
     BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
 };
-use crate::geom::{AuOrAuto, LengthPercentageOrAuto, PhysicalRect, PhysicalSides};
+use crate::geom::{AuOrAuto, LengthPercentageOrAuto, PhysicalPoint, PhysicalRect, PhysicalSides};
 use crate::layout_impl::LayoutThread;
 use crate::style_ext::ComputedValuesExt;
 use crate::taffy::SpecificTaffyGridInfo;
@@ -131,12 +132,173 @@ pub(crate) fn process_box_area_request(
     })?
 }
 
+fn collect_text_fragment_rects(
+    layout_thread: &LayoutThread,
+    scroll_tree: &ScrollTree,
+    fragment: &Fragment,
+    target_opaque: OpaqueNode,
+    current_origin: PhysicalPoint<Au>,
+    current_spatial_node: Option<ScrollTreeNodeId>,
+    results: &mut CSSPixelRectVec,
+) {
+    match fragment {
+        Fragment::LayoutRoot(layout_root) => {
+            collect_text_fragment_rects(
+                layout_thread,
+                scroll_tree,
+                &layout_root.inner(),
+                target_opaque,
+                current_origin,
+                current_spatial_node,
+                results,
+            );
+        },
+        Fragment::Box(box_frag) | Fragment::Float(box_frag) => {
+            let spatial_node = box_frag.spatial_tree_node().or(current_spatial_node);
+            let child_origin = box_frag
+                .cumulative_content_box_rect(layout_thread.into())
+                .origin;
+            for child in &box_frag.children {
+                collect_text_fragment_rects(
+                    layout_thread,
+                    scroll_tree,
+                    child,
+                    target_opaque,
+                    child_origin,
+                    spatial_node,
+                    results,
+                );
+            }
+        },
+        Fragment::Positioning(pos_frag) => {
+            let child_origin = pos_frag
+                .offset_by_containing_block(&pos_frag.base.rect(), layout_thread.into())
+                .origin;
+            for child in &pos_frag.children {
+                collect_text_fragment_rects(
+                    layout_thread,
+                    scroll_tree,
+                    child,
+                    target_opaque,
+                    child_origin,
+                    current_spatial_node,
+                    results,
+                );
+            }
+        },
+        Fragment::Text(text_frag) => {
+            let matches_target = text_frag.base.tag.is_some_and(|tag| {
+                tag.node == target_opaque && tag.pseudo_element_chain.innermost().is_none()
+            });
+            if !matches_target {
+                return;
+            }
+            let rect = text_frag.base.rect().translate(current_origin.to_vector());
+            if rect.size.width <= Au::zero() || rect.size.height <= Au::zero() {
+                return;
+            }
+            let Some(transformed) = current_spatial_node
+                .map(|id| scroll_tree.cumulative_node_to_root_transform(id))
+                .and_then(|transform| transform_au_rectangle(rect, transform))
+            else {
+                return;
+            };
+            if transformed.size.width > Au::zero() && transformed.size.height > Au::zero() {
+                results.push(transformed);
+            }
+        },
+        Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
+        Fragment::Image(_) |
+        Fragment::IFrame(_) => {},
+    }
+}
+
+#[expect(unsafe_code)]
+fn text_node_box_areas(
+    layout_thread: &LayoutThread,
+    stacking_context_tree: &StackingContextTree,
+    node: ServoLayoutNode<'_>,
+) -> CSSPixelRectVec {
+    let target_opaque = node.opaque();
+    let mut cur = unsafe { node.dangerous_flat_tree_parent() };
+    let mut ancestor_fragments = Vec::new();
+    let mut spatial_ancestor = None;
+    while let Some(ancestor) = cur {
+        let fragments = ancestor.fragments_for_pseudo(None);
+        if !fragments.is_empty() {
+            ancestor_fragments = fragments;
+            spatial_ancestor = Some(ancestor);
+            break;
+        }
+        cur = unsafe { ancestor.dangerous_flat_tree_parent() };
+    }
+
+    let mut initial_spatial_node = ancestor_fragments.iter().find_map(|fragment| {
+        fragment
+            .retrieve_box_fragment()
+            .and_then(|box_frag| box_frag.spatial_tree_node())
+    });
+    if initial_spatial_node.is_none() {
+        let mut parent =
+            spatial_ancestor.and_then(|ancestor| unsafe { ancestor.dangerous_flat_tree_parent() });
+        while let Some(ancestor) = parent {
+            if let Some(id) = ancestor
+                .fragments_for_pseudo(None)
+                .iter()
+                .find_map(|fragment| {
+                    fragment
+                        .retrieve_box_fragment()
+                        .and_then(|box_frag| box_frag.spatial_tree_node())
+                })
+            {
+                initial_spatial_node = Some(id);
+                break;
+            }
+            parent = unsafe { ancestor.dangerous_flat_tree_parent() };
+        }
+    }
+
+    let mut raw_rects = CSSPixelRectVec::new();
+    let scroll_tree = &stacking_context_tree.paint_info.scroll_tree;
+    for fragment in &ancestor_fragments {
+        collect_text_fragment_rects(
+            layout_thread,
+            scroll_tree,
+            fragment,
+            target_opaque,
+            PhysicalPoint::zero(),
+            initial_spatial_node,
+            &mut raw_rects,
+        );
+    }
+
+    let mut merged = CSSPixelRectVec::new();
+    for rect in raw_rects {
+        if let Some(prev) = merged.last_mut() {
+            let prev_bottom = prev.origin.y + prev.size.height;
+            let next_bottom = rect.origin.y + rect.size.height;
+            let overlap = prev_bottom.min(next_bottom) - prev.origin.y.max(rect.origin.y);
+            let min_h = prev.size.height.min(rect.size.height);
+            if overlap > min_h / 2 {
+                *prev = prev.union(&rect);
+                continue;
+            }
+        }
+        merged.push(rect);
+    }
+    merged
+}
+
 pub(crate) fn process_box_areas_request(
     layout_thread: &LayoutThread,
     stacking_context_tree: &StackingContextTree,
     node: ServoLayoutNode<'_>,
     area: BoxAreaType,
 ) -> CSSPixelRectVec {
+    if node.type_id() == Some(LayoutNodeType::Text) {
+        return text_node_box_areas(layout_thread, stacking_context_tree, node);
+    }
+
     let fragments = node.fragments_for_pseudo(None);
     let transform =
         root_transform_for_fragments(&stacking_context_tree.paint_info.scroll_tree, &fragments);
@@ -212,6 +374,44 @@ pub fn process_node_scroll_area_request(
 }
 
 /// Return the resolved value of property for a given (pseudo)element.
+fn serialize_transform_value(
+    style: &ComputedValues,
+    box_fragment: Option<&BoxFragment>,
+) -> Result<String, ()> {
+    let transform_list = &style.get_box().transform;
+
+    // > When the computed value is a <transform-list>, the resolved value is one
+    // > <matrix()> function or one <matrix3d()> function computed by the following
+    // > algorithm:
+    if transform_list.0.is_empty() {
+        return Ok("none".into());
+    }
+
+    // > 1. Let transform be a 4x4 matrix initialized to the identity matrix. The
+    // >    elements m11, m22, m33 and m44 of transform must be set to 1; all other
+    // >    elements of transform must be set to 0.
+    // > 2. Post-multiply all <transform-function>s in <transform-list> to transform.
+    let length_rect =
+        box_fragment.map(|bf| au_rect_to_length_rect(&bf.border_rect()).to_untyped());
+    let (transform, is_3d) = transform_list
+        .to_transform_3d_matrix(length_rect.as_ref())
+        .or_else(|_| {
+            let zero_rect = au_rect_to_length_rect(&Rect::<Au, CSSPixel>::zero()).to_untyped();
+            transform_list.to_transform_3d_matrix(Some(&zero_rect))
+        })?;
+
+    // > 3. Chose between <matrix()> or <matrix3d()> serialization:
+    // >   ↪ If transform is a 2D matrix: Serialize transform to a <matrix()> function.
+    // >   ↪ Otherwise: Serialize transform to a <matrix3d()> function. Chose between
+    // >     <matrix()> or <matrix3d()> serialization:
+    let matrix = Matrix3D::from(transform);
+    if !is_3d {
+        Ok(matrix.into_2d()?.to_css_string())
+    } else {
+        Ok(matrix.to_css_string())
+    }
+}
+
 /// <https://drafts.csswg.org/cssom/#resolved-value>
 pub fn process_resolved_style_request(
     context: &SharedStyleContext,
@@ -258,37 +458,6 @@ pub fn process_resolved_style_request(
     }
     .to_physical(style.writing_mode);
 
-    // From <https://drafts.csswg.org/css-transforms-2/#serialization-of-the-computed-value>
-    let serialize_transform_value = |box_fragment: Option<&BoxFragment>| -> Result<String, ()> {
-        let transform_list = &style.get_box().transform;
-
-        // > When the computed value is a <transform-list>, the resolved value is one
-        // > <matrix()> function or one <matrix3d()> function computed by the following
-        // > algorithm:
-        if transform_list.0.is_empty() {
-            return Ok("none".into());
-        }
-
-        // > 1. Let transform be a 4x4 matrix initialized to the identity matrix. The
-        // >    elements m11, m22, m33 and m44 of transform must be set to 1; all other
-        // >    elements of transform must be set to 0.
-        // > 2. Post-multiply all <transform-function>s in <transform-list> to transform.
-        let length_rect = box_fragment
-            .map(|box_fragment| au_rect_to_length_rect(&box_fragment.border_rect()).to_untyped());
-        let (transform, is_3d) = transform_list.to_transform_3d_matrix(length_rect.as_ref())?;
-
-        // > 3. Chose between <matrix()> or <matrix3d()> serialization:
-        // >   ↪ If transform is a 2D matrix: Serialize transform to a <matrix()> function.
-        // >   ↪ Otherwise: Serialize transform to a <matrix3d()> function. Chose between
-        // >     <matrix()> or <matrix3d()> serialization:
-        let matrix = Matrix3D::from(transform);
-        if !is_3d {
-            Ok(matrix.into_2d()?.to_css_string())
-        } else {
-            Ok(matrix.to_css_string())
-        }
-    };
-
     let computed_style = |fragment: Option<&Fragment>| match longhand_id {
         LonghandId::MinWidth
             if style.get_min_width() == &Size::Auto &&
@@ -302,7 +471,7 @@ pub fn process_resolved_style_request(
         {
             String::from("0px")
         },
-        LonghandId::Transform => match serialize_transform_value(None) {
+        LonghandId::Transform => match serialize_transform_value(style, None) {
             Ok(value) => value,
             Err(..) => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
         },
@@ -363,7 +532,7 @@ pub fn process_resolved_style_request(
         // serialization of the value.
         if let Some(box_fragment) = fragment.retrieve_box_fragment() &&
             longhand_id == LonghandId::Transform &&
-            let Ok(string) = serialize_transform_value(Some(&box_fragment))
+            let Ok(string) = serialize_transform_value(style, Some(&box_fragment))
         {
             return string;
         }
@@ -549,6 +718,10 @@ pub fn process_resolved_style_request_for_unstyled_node(
         // The resolved value of an automatic minimum size is zero when no box is generated.
         LonghandId::MinWidth if style.get_min_width() == &Size::Auto => String::from("0px"),
         LonghandId::MinHeight if style.get_min_height() == &Size::Auto => String::from("0px"),
+        LonghandId::Transform => match serialize_transform_value(style, None) {
+            Ok(value) => value,
+            Err(..) => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
+        },
 
         // No need to care about used values here, since we're on a display: none
         // subtree, use the computed value.

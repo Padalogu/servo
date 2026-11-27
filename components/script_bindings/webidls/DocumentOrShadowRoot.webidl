@@ -9,7 +9,7 @@
  */
 
 interface mixin DocumentOrShadowRoot {
-  // Selection? getSelection();
+  Selection? getSelection();
   Element? elementFromPoint (double x, double y);
   sequence<Element> elementsFromPoint (double x, double y);
   // CaretPosition? caretPositionFromPoint (double x, double y);
@@ -26,4 +26,9 @@ partial interface mixin DocumentOrShadowRoot {
 // https://fullscreen.spec.whatwg.org/#api
 partial interface mixin DocumentOrShadowRoot {
   [LegacyLenientSetter] readonly attribute Element? fullscreenElement;
+};
+
+partial interface mixin DocumentOrShadowRoot {
+  [Pref="dom_web_animations_enabled"]
+  sequence<Animation> getAnimations();
 };

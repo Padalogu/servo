@@ -22,11 +22,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::dom::bindings::codegen::Bindings::URLBinding::URLMethods;
+use crate::dom::bindings::codegen::UnionTypes::BlobOrMediaSource;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::blob::Blob;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::url::urlhelper::UrlHelper;
 use crate::dom::url::urlsearchparams::URLSearchParams;
@@ -193,14 +193,27 @@ impl URLMethods<crate::DomTypeHolder> for URL {
     }
 
     /// <https://w3c.github.io/FileAPI/#dfn-createObjectURL>
-    fn CreateObjectURL(global: &GlobalScope, blob: &Blob) -> DOMString {
+    /// <https://w3c.github.io/media-source/#dom-url-createobjecturl>
+    fn CreateObjectURL(global: &GlobalScope, obj: BlobOrMediaSource) -> DOMString {
         // XXX: Second field is an unicode-serialized Origin, it is a temporary workaround
         //      and should not be trusted. See issue https://github.com/servo/servo/issues/11722
         let origin = global.origin();
 
-        let id = blob.get_blob_url_id();
-
-        DOMString::from(URL::unicode_serialization_blob_url(origin.immutable(), &id))
+        match obj {
+            BlobOrMediaSource::Blob(blob) => {
+                let id = blob.get_blob_url_id();
+                DOMString::from(URL::unicode_serialization_blob_url(origin.immutable(), &id))
+            },
+            BlobOrMediaSource::MediaSource(media_source) => {
+                let id = Uuid::new_v4();
+                let url_string = URL::unicode_serialization_blob_url(origin.immutable(), &id);
+                let canonical = ServoUrl::parse(&url_string)
+                    .map(|u| u.as_str().to_string())
+                    .unwrap_or(url_string);
+                global.register_media_source_url(canonical.clone(), &media_source);
+                DOMString::from(canonical)
+            },
+        }
     }
 
     /// <https://w3c.github.io/FileAPI/#dfn-revokeObjectURL>
@@ -211,15 +224,20 @@ impl URLMethods<crate::DomTypeHolder> for URL {
         let origin = global.origin().immutable().clone();
 
         if let Ok(url) = ServoUrl::parse(&url.str()) &&
-            url.fragment().is_none() &&
-            let Ok(id) = parse_blob_url(&url)
+            url.fragment().is_none()
         {
-            let resource_threads = global.resource_threads();
-            let (tx, rx) = generic_channel::channel(global.time_profiler_chan().clone()).unwrap();
-            let msg = FileManagerThreadMsg::RevokeBlobURL(id, origin, tx);
-            let _ = resource_threads.send(CoreResourceMsg::ToFileManager(msg));
+            if global.revoke_media_source_url(url.as_str()) {
+                return;
+            }
+            if let Ok(id) = parse_blob_url(&url) {
+                let resource_threads = global.resource_threads();
+                let (tx, rx) =
+                    generic_channel::channel(global.time_profiler_chan().clone()).unwrap();
+                let msg = FileManagerThreadMsg::RevokeBlobURL(id, origin, tx);
+                let _ = resource_threads.send(CoreResourceMsg::ToFileManager(msg));
 
-            let _ = rx.recv().unwrap();
+                let _ = rx.recv().unwrap();
+            }
         }
     }
 

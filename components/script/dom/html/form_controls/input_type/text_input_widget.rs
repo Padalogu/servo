@@ -35,13 +35,21 @@ pub(crate) struct TextInputWidget {
 }
 
 impl TextInputWidget {
+    pub(crate) fn has_shadow_tree(&self) -> bool {
+        self.shadow_tree.borrow().is_some()
+    }
+
     pub(crate) fn update_shadow_tree(
         &self,
         cx: &mut JSContext,
         element: &(impl TextControlElement + DerivedFrom<Element>),
     ) {
-        self.ensure_shadow_tree(cx, element.upcast())
-            .update(cx, self, element)
+        let was_uninitialized = self.shadow_tree.borrow().is_none();
+        let shadow_tree = self.ensure_shadow_tree(cx, element.upcast());
+        shadow_tree.update(cx, self, element);
+        if was_uninitialized && !element.placeholder_text().is_empty() {
+            shadow_tree.update_placeholder(cx, element);
+        }
     }
 
     pub(crate) fn update_placeholder_contents(
@@ -49,8 +57,10 @@ impl TextInputWidget {
         cx: &mut JSContext,
         element: &(impl TextControlElement + DerivedFrom<Element>),
     ) {
-        self.ensure_shadow_tree(cx, element.upcast())
-            .update_placeholder(cx, element);
+        let shadow_tree = self.shadow_tree.borrow();
+        if let Some(ref shadow_tree) = *shadow_tree {
+            shadow_tree.update_placeholder(cx, element);
+        }
     }
 
     /// Returns whether `new_range` was successfully set on an existing text run.

@@ -44,6 +44,20 @@ impl GStreamerRegistryScanner {
         codecs.iter().all(|&codec| self.is_codec_supported(codec))
     }
 
+    fn register_vp8_codecs(&mut self) {
+        self.supported_codecs.insert("vp8");
+        self.supported_codecs.insert("x-vp8");
+        self.supported_codecs.insert("vp8.0");
+        self.supported_codecs.insert("vp08*");
+    }
+
+    fn register_vp9_codecs(&mut self) {
+        self.supported_codecs.insert("vp9");
+        self.supported_codecs.insert("x-vp9");
+        self.supported_codecs.insert("vp9.0");
+        self.supported_codecs.insert("vp09*");
+    }
+
     fn initialize(&mut self) {
         let audio_decoder_factories = gstreamer::ElementFactory::factories_with_type(
             gstreamer::ElementFactoryType::DECODER | gstreamer::ElementFactoryType::MEDIA_AUDIO,
@@ -103,15 +117,11 @@ impl GStreamerRegistryScanner {
             }
 
             if is_vp8_decoder_available {
-                self.supported_codecs.insert("vp8");
-                self.supported_codecs.insert("x-vp8");
-                self.supported_codecs.insert("vp8.0");
+                self.register_vp8_codecs();
             }
 
             if is_vp9_decoder_available {
-                self.supported_codecs.insert("vp9");
-                self.supported_codecs.insert("x-vp9");
-                self.supported_codecs.insert("vp9.0");
+                self.register_vp9_codecs();
             }
 
             if is_opus_supported {
@@ -266,5 +276,43 @@ fn has_element_for_media_type(
             false
         },
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vp8_and_vp9_codec_matching_supports_profile_prefixes() {
+        let mut scanner = GStreamerRegistryScanner {
+            supported_mime_types: HashSet::new(),
+            supported_codecs: HashSet::new(),
+        };
+        scanner.register_vp8_codecs();
+        scanner.register_vp9_codecs();
+        scanner.supported_codecs.insert("av01*");
+        scanner.supported_codecs.insert("mp4a*");
+
+        assert!(scanner.is_codec_supported("vp09.00.10.08"));
+        assert!(scanner.is_codec_supported("vp09.02.10.10.01.09.16.09.01"));
+        assert!(scanner.is_codec_supported("vp09"));
+        assert!(scanner.is_codec_supported("vp9"));
+        assert!(scanner.is_codec_supported("x-vp9"));
+        assert!(scanner.is_codec_supported("vp9.0"));
+
+        assert!(scanner.is_codec_supported("vp08.00.41.08"));
+        assert!(scanner.is_codec_supported("vp08"));
+        assert!(scanner.is_codec_supported("vp8"));
+        assert!(scanner.is_codec_supported("x-vp8"));
+        assert!(scanner.is_codec_supported("vp8.0"));
+
+        assert!(scanner.is_codec_supported("av01.0.04M.08"));
+        assert!(scanner.is_codec_supported("mp4a.40.2"));
+        assert!(!scanner.is_codec_supported("vp10"));
+        assert!(!scanner.is_codec_supported("hev1.1.6.L93.B0"));
+
+        assert!(scanner.are_all_codecs_supported(&vec!["vp09.00.10.08", "mp4a.40.2"]));
+        assert!(!scanner.are_all_codecs_supported(&vec!["vp09.00.10.08", "hev1.1.6.L93.B0"]));
     }
 }

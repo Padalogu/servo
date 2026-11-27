@@ -14,6 +14,7 @@ use embedder_traits::{EmbedderMsg, ProtocolHandlerUpdateRegistration, RegisterOr
 use headers::HeaderMap;
 use http::header::{self, HeaderValue};
 use js::context::JSContext;
+use js::realm::CurrentRealm;
 use js::rust::MutableHandleValue;
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::request::{
@@ -30,6 +31,7 @@ use servo_config::pref;
 use servo_url::ServoUrl;
 
 use crate::ScriptThread;
+use crate::dom::bindings::codegen::Bindings::MediaKeySystemAccessBinding::MediaKeySystemConfiguration;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
 #[cfg(feature = "gamepad")]
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionName;
@@ -45,6 +47,9 @@ use crate::dom::bluetooth::Bluetooth;
 use crate::dom::clipboard::Clipboard;
 use crate::dom::credentialmanagement::credentialscontainer::CredentialsContainer;
 use crate::dom::csp::{GlobalCspReporting, Violation};
+use crate::dom::eme::mediakeysystemaccess::{
+    CLEARKEY_KEY_SYSTEM, MediaKeySystemAccess, evaluate_clearkey_configuration,
+};
 #[cfg(feature = "gamepad")]
 use crate::dom::gamepad::Gamepad;
 use crate::dom::geolocation::Geolocation;
@@ -56,6 +61,7 @@ use crate::dom::navigatorinfo;
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::permissions::Permissions;
 use crate::dom::pluginarray::PluginArray;
+use crate::dom::promise::{Promise, RootedPromise};
 use crate::dom::serviceworkercontainer::ServiceWorkerContainer;
 use crate::dom::servointernals::ServoInternals;
 use crate::dom::storagemanager::StorageManager;
@@ -674,6 +680,49 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     /// <https://w3c.github.io/screen-wake-lock/#dom-navigator-wakelock>
     fn WakeLock(&self, cx: &mut js::context::JSContext) -> DomRoot<WakeLock> {
         self.wake_lock.or_init(|| WakeLock::new(cx, &self.global()))
+    }
+
+    /// <https://w3c.github.io/encrypted-media/#dom-navigator-requestmediakeysystemaccess>
+    fn RequestMediaKeySystemAccess(
+        &self,
+        cx: &mut CurrentRealm,
+        key_system: DOMString,
+        supported_configurations: Vec<MediaKeySystemConfiguration>,
+    ) -> RootedPromise {
+        let promise = Promise::new_in_realm(cx);
+        let key_system_str = key_system.str();
+        if key_system_str.is_empty() || supported_configurations.is_empty() {
+            promise.reject_error(
+                cx,
+                Error::Type(c"keySystem and supportedConfigurations must not be empty".to_owned()),
+            );
+            return promise;
+        }
+        if &*key_system_str != CLEARKEY_KEY_SYSTEM {
+            promise.reject_error(
+                cx,
+                Error::NotSupported(Some(format!(
+                    "Unsupported key system: {}",
+                    &*key_system_str
+                ))),
+            );
+            return promise;
+        }
+        for candidate in &supported_configurations {
+            if let Some(resolved) = evaluate_clearkey_configuration(candidate) {
+                let access =
+                    MediaKeySystemAccess::new(cx, &self.global(), CLEARKEY_KEY_SYSTEM, resolved);
+                promise.resolve_native(cx, &access);
+                return promise;
+            }
+        }
+        promise.reject_error(
+            cx,
+            Error::NotSupported(Some(
+                "None of the requested configurations are supported for org.w3.clearkey".into(),
+            )),
+        );
+        promise
     }
 }
 

@@ -75,9 +75,11 @@ use crate::dom::links::htmlhyperlinkelementutils::HyperlinkElementTraits;
 use crate::dom::node::focus::FocusTrigger;
 use crate::dom::node::{self, Node, NodeTraits};
 use crate::dom::pointerevent::{PointerEvent, PointerId};
+#[cfg(feature = "gamepad")]
+use crate::dom::types::GlobalScope;
 use crate::dom::types::{
-    CompositionEvent, Element, Event, EventTarget, GlobalScope, HTMLAnchorElement, HTMLAreaElement,
-    HTMLElement, HTMLLabelElement, MouseEvent, Touch, TouchEvent, TouchList, WheelEvent, Window,
+    CompositionEvent, Element, Event, EventTarget, HTMLAnchorElement, HTMLAreaElement, HTMLElement,
+    HTMLLabelElement, MouseEvent, Touch, TouchEvent, TouchList, WheelEvent, Window,
 };
 use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollRequirement, ScrollingBoxAxis};
 use crate::drag::drag_gesture::DragGesture;
@@ -1125,6 +1127,7 @@ impl DocumentEventHandler {
                     if !released_disconnected {
                         self.process_pending_pointer_capture(cx, pointer_id, "mouse", true);
                     }
+                    document.handle_popover_pointerdown(cx, node);
                     pointer_event_result
                 };
 
@@ -1219,6 +1222,7 @@ impl DocumentEventHandler {
                     if exactly_one_button {
                         self.implicit_release_pointer_capture(cx, pointer_id, "mouse", true);
                     }
+                    document.handle_popover_pointerup(cx, node);
                 }
 
                 // Step 7. dispatch event at target.
@@ -1515,6 +1519,20 @@ impl DocumentEventHandler {
             Some(hit_test_result.point_in_node),
         );
         pointer_event.upcast::<Event>().fire(cx, &pointer_target);
+
+        match event.event_type {
+            TouchEventType::Down => {
+                self.window
+                    .Document()
+                    .handle_popover_pointerdown(cx, &hit_test_result.node);
+            },
+            TouchEventType::Up => {
+                self.window
+                    .Document()
+                    .handle_popover_pointerup(cx, &hit_test_result.node);
+            },
+            _ => {},
+        }
 
         // Process pending pointer capture after firing event, but skip if we just
         // released a disconnected capture (to avoid immediately re-capturing).
@@ -2287,6 +2305,13 @@ impl DocumentEventHandler {
                     .focus_handler()
                     .sequential_focus_navigation_via_keyboard_event(cx, event);
                 return input_event_result | InputEventResult::Consumed;
+            },
+            Key::Named(NamedKey::Escape) => {
+                if let Some(popover) = document.topmost_auto_popover() {
+                    let _ = popover.hide_popover(cx, true, true, false);
+                    return input_event_result | InputEventResult::Consumed;
+                }
+                return input_event_result;
             },
             _ => return input_event_result,
         };

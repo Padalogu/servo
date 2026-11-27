@@ -2,12 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use euclid::default::Size2D;
 use layout_api::MediaFrame;
 use media::{GLPlayerMsg, GLPlayerMsgForward, WindowGLContext};
-use paint_api::{CrossProcessPaintApi, ImageUpdate, SerializableImageData};
+use paint_api::{
+    CrossProcessPaintApi, ImageUpdate, MAX_PENDING_RAW_IMAGE_UPDATE_BYTES, SerializableImageData,
+};
 use pixels::RasterImage;
 use servo_base::generic_channel::{GenericCallback, GenericSharedMemory};
 use servo_base::id::WebViewId;
@@ -82,6 +85,9 @@ pub(crate) struct MediaFrameRenderer {
     current_frame_holder: Option<FrameHolder>,
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     poster_frame: Option<MediaFrame>,
+    #[conditional_malloc_size_of]
+    pending_raw_bytes: Arc<AtomicUsize>,
+    ack_callback: Option<GenericCallback<usize>>,
 }
 
 impl MediaFrameRenderer {
@@ -90,6 +96,18 @@ impl MediaFrameRenderer {
         paint_api: CrossProcessPaintApi,
         player_context: WindowGLContext,
     ) -> Self {
+        let pending_raw_bytes = Arc::new(AtomicUsize::new(0));
+        let ack_pending_raw_bytes = pending_raw_bytes.clone();
+        let ack_callback = GenericCallback::new(move |message| {
+            if let Ok(bytes) = message {
+                let _ = ack_pending_raw_bytes.try_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |current| Some(current.saturating_sub(bytes)),
+                );
+            }
+        })
+        .ok();
         Self {
             webview_id,
             player_id: None,
@@ -101,7 +119,44 @@ impl MediaFrameRenderer {
             very_old_frame: None,
             current_frame_holder: None,
             poster_frame: None,
+            pending_raw_bytes,
+            ack_callback,
         }
+    }
+
+    fn try_reserve_pending_raw_bytes(
+        pending_raw_bytes: &AtomicUsize,
+        has_ack_callback: bool,
+        bytes: usize,
+    ) -> bool {
+        if bytes == 0 {
+            return pending_raw_bytes.load(Ordering::Acquire) < MAX_PENDING_RAW_IMAGE_UPDATE_BYTES;
+        }
+        if !has_ack_callback {
+            return false;
+        }
+        pending_raw_bytes
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                if current >= MAX_PENDING_RAW_IMAGE_UPDATE_BYTES {
+                    return None;
+                }
+                let next = current.saturating_add(bytes);
+                if current == 0 || next <= MAX_PENDING_RAW_IMAGE_UPDATE_BYTES {
+                    Some(next)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    fn release_pending_raw_bytes(pending_raw_bytes: &AtomicUsize, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = pending_raw_bytes.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            Some(current.saturating_sub(bytes))
+        });
     }
 
     pub(crate) fn current_frame(&self) -> Option<MediaFrame> {
@@ -229,6 +284,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
         }
 
         let mut updates = smallvec::smallvec![];
+        let mut reserved_raw_bytes = 0usize;
 
         if let Some(old_image_key) =
             std::mem::replace(&mut self.very_old_frame, self.old_frame.take())
@@ -248,15 +304,24 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 if current_frame.width == frame.get_width() &&
                     current_frame.height == frame.get_height() =>
             {
-                if !frame.is_gl_texture() {
-                    updates.push(ImageUpdate::UpdateImage(
-                        current_frame.image_key,
-                        descriptor,
-                        SerializableImageData::Raw(GenericSharedMemory::from_arc_vec(
-                            frame.get_data(),
-                        )),
-                        None,
-                    ));
+                if !frame.is_gl_texture() && !paint_api::raw_image_update_budget_exceeded() {
+                    let frame_data = frame.get_data();
+                    let raw_bytes = frame_data.len();
+                    if Self::try_reserve_pending_raw_bytes(
+                        &self.pending_raw_bytes,
+                        self.ack_callback.is_some(),
+                        raw_bytes,
+                    ) {
+                        reserved_raw_bytes = raw_bytes;
+                        updates.push(ImageUpdate::UpdateImage(
+                            current_frame.image_key,
+                            descriptor,
+                            SerializableImageData::Raw(GenericSharedMemory::from_arc_vec(
+                                frame_data,
+                            )),
+                            None,
+                        ));
+                    }
                 }
 
                 self.current_frame_holder
@@ -362,7 +427,18 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 ));
             },
         }
-        self.paint_api
-            .update_images(self.webview_id.into(), updates);
+        if !updates.is_empty() {
+            let ack = (reserved_raw_bytes > 0)
+                .then(|| self.ack_callback.clone())
+                .flatten();
+            if !self
+                .paint_api
+                .update_video_images(self.webview_id.into(), updates, ack)
+            {
+                Self::release_pending_raw_bytes(&self.pending_raw_bytes, reserved_raw_bytes);
+            }
+        } else {
+            Self::release_pending_raw_bytes(&self.pending_raw_bytes, reserved_raw_bytes);
+        }
     }
 }

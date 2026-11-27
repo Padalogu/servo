@@ -119,7 +119,12 @@ impl HTMLDialogElement {
             )));
         }
 
-        // TODO: Step 5. If subject is in the popover showing state, then throw an "InvalidStateError" DOMException.
+        // Step 5. If subject is in the popover showing state, then throw an "InvalidStateError" DOMException.
+        if self.upcast::<HTMLElement>().is_popover_open() {
+            return Err(Error::InvalidState(Some(
+                "Cannot call showModal() on a dialog that is currently an open popover.".into(),
+            )));
+        }
 
         // Step 6. If the result of firing an event named beforetoggle, using ToggleEvent, with the cancelable attribute initialized to true, the oldState attribute initialized to "closed", the newState attribute initialized to "open", and the source attribute initialized to source at subject is false, then return.
         let event = ToggleEvent::new(
@@ -147,7 +152,10 @@ impl HTMLDialogElement {
             return Ok(());
         }
 
-        // TODO: Step 9. If subject is in the popover showing state, then return.
+        // Step 9. If subject is in the popover showing state, then return.
+        if self.upcast::<HTMLElement>().is_popover_open() {
+            return Ok(());
+        }
 
         // Step 10. Queue a dialog toggle event task given subject, "closed", "open", and source.
         self.queue_dialog_toggle_event_task("closed", "open", source);
@@ -163,26 +171,19 @@ impl HTMLDialogElement {
 
         // TODO: Step 14. Set subject's node document to be blocked by the modal dialog subject.
 
-        // TODO: Step 15. If subject's node document's top layer does not already contain subject, then add an element to the top layer given subject.
+        // Step 15. If subject's node document's top layer does not already contain subject, then add an element to the top layer given subject.
+        let document = subject.owner_document();
+        document.add_to_top_layer(subject);
 
         // Step 16. Set subject's previously focused element to the focused element.
         self.upcast::<HTMLElement>().set_previously_focused_element(
-            self.owner_document()
-                .focus_handler()
-                .focused_area()
-                .element(),
+            document.focus_handler().focused_area().element(),
             cx.no_gc(),
         );
 
-        // TODO: Step 17. Let document be subject's node document.
-
-        // TODO: Step 18. Let hideUntil be the result of running topmost popover ancestor given subject, document's showing hint popover list, null, and false.
-
-        // TODO: Step 19. If hideUntil is null, then set hideUntil to the result of running topmost popover ancestor given subject, document's showing auto popover list, null, and false.
-
-        // TODO: Step 20. If hideUntil is null, then set hideUntil to document.
-
-        // TODO: Step 21. Run hide all popovers until given hideUntil, false, and true.
+        // Step 17-21. Hide popovers above subject's topmost popover ancestor.
+        let hide_until = document.topmost_popover_ancestor(subject.upcast::<Node>(), None, false);
+        document.hide_all_popovers_until(cx, hide_until.as_deref(), false, true);
 
         // Step 22. Run the dialog focusing steps given subject.
         self.run_dialog_focusing_steps(cx);
@@ -257,7 +258,10 @@ impl HTMLDialogElement {
         subject.remove_attribute(cx, &ns!(), &local_name!("open"));
         subject.set_open_state(cx.no_gc(), false);
 
-        // TODO: Step 6. If is modal of subject is true, then request an element to be removed from the top layer given subject.
+        // Step 6. If is modal of subject is true, then request an element to be removed from the top layer given subject.
+        if subject.state().contains(ElementState::MODAL) {
+            subject.owner_document().remove_from_top_layer(subject);
+        }
 
         // Step 7. Let wasModal be the value of subject's is modal flag.
         let was_modal = subject.state().contains(ElementState::MODAL);
@@ -607,15 +611,10 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
             cx.no_gc(),
         );
 
-        // TODO: Step 8. Let document be this's node document.
-
-        // TODO: Step 9. Let hideUntil be the result of running topmost popover ancestor given this, document's showing hint popover list, null, and false.
-
-        // TODO: Step 10. If hideUntil is null, then set hideUntil to the result of running topmost popover ancestor given this, document's showing auto popover list, null, and false.
-
-        // TODO: Step 11. If hideUntil is null, then set hideUntil to document.
-
-        // TODO: Step 12. Run hide all popovers until given hideUntil, false, and true.
+        // Step 8-12. Hide popovers above this's topmost popover ancestor.
+        let document = self.owner_document();
+        let hide_until = document.topmost_popover_ancestor(self.upcast::<Node>(), None, false);
+        document.hide_all_popovers_until(cx, hide_until.as_deref(), false, true);
 
         // Step 13. Run the dialog focusing steps given this.
         self.run_dialog_focusing_steps(cx);
@@ -678,7 +677,10 @@ impl VirtualMethods for HTMLDialogElement {
             return true;
         }
 
-        // TODO Step 1. If element is in the popover showing state, then return.
+        // Step 1. If element is in the popover showing state, then return.
+        if self.upcast::<HTMLElement>().is_popover_open() {
+            return false;
+        }
         let element = self.upcast::<Element>();
 
         // Step 2. If command is in the Close state and element has an open attribute, then
@@ -736,8 +738,11 @@ impl VirtualMethods for HTMLDialogElement {
             self.dialog_cleanup_steps(cx.no_gc());
         }
 
-        // TODO Step 2. If removedNode's node document's top layer contains removedNode, then remove
+        // Step 2. If removedNode's node document's top layer contains removedNode, then remove
         // an element from the top layer immediately given removedNode.
+        removed_node
+            .owner_document()
+            .remove_from_top_layer(removed_node);
 
         // Step 3. Set is modal of removedNode to false.
         removed_node.set_modal_state(cx.no_gc(), false)

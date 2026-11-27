@@ -29,19 +29,17 @@ impl Element {
     pub(crate) fn focusable_area_kind(&self, no_gc: &NoGC) -> FocusableAreaKind {
         // Do not allow unrendered, disconnected, disabled or inert nodes to be focusable areas ever.
         let node: &Node = self.upcast();
-        if !node.is_connected() ||
-            !self.has_css_layout_box() ||
-            self.is_actually_disabled() ||
-            node.is_inert()
-        {
+        if !node.is_connected() || self.is_actually_disabled() || node.is_inert() {
             return Default::default();
         }
 
         // <https://www.w3.org/TR/css-display-4/#visibility>
-        // Invisible elements are removed from navigation.
-        if self
-            .style()
-            .is_some_and(|style| style.get_inherited_box().visibility != Visibility::Visible)
+        // Invisible elements and elements without a CSS layout box are not focusable.
+        let Some(style) = self.style() else {
+            return Default::default();
+        };
+        if style.get_display().is_none() ||
+            style.get_inherited_box().visibility != Visibility::Visible
         {
             return Default::default();
         }

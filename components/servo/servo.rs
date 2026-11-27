@@ -54,7 +54,9 @@ use script::JSEngineSetup;
 use script::ServiceWorkerManager;
 #[cfg(feature = "multiprocess")]
 use servo_background_hang_monitor::HangMonitorRegister;
-use servo_base::generic_channel::{GenericCallback, GenericSender, RoutedReceiver, SendError};
+use servo_base::generic_channel::{GenericCallback, RoutedReceiver, SendError};
+#[cfg(feature = "bluetooth")]
+use servo_base::generic_channel::GenericSender;
 pub use servo_base::id::WebViewId;
 use servo_base::id::{EMBEDDER_PIPELINE_NAMESPACE_ID, PipelineId, PipelineNamespace};
 #[cfg(feature = "bluetooth")]
@@ -1203,6 +1205,16 @@ impl Servo {
 
     pub fn site_data_manager(&self) -> &SiteDataManager {
         &self.0.site_data_manager
+    }
+
+    pub fn notify_memory_pressure(&self, clear_http_cache: bool) {
+        if self.0.shutdown_state.get() != ShutdownState::NotShuttingDown {
+            return;
+        }
+        if clear_http_cache {
+            self.network_manager().clear_cache();
+        }
+        self.paint().notify_memory_pressure();
     }
 
     /// When an [`ActionRequest`] is received from AccessKit, forward it to the appropriate document

@@ -104,6 +104,13 @@ pub(crate) enum FocusTrigger {
     Script,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FocusOutcome {
+    NotFocusable,
+    AlreadyFocused,
+    NewlyFocused,
+}
+
 impl Node {
     /// Returns the appropriate [`FocusableArea`] when this [`Node`] is clicked on according to
     /// <https://www.w3.org/TR/pointerevents4/#handle-native-mouse-down>.
@@ -362,6 +369,19 @@ impl Node {
         fallback_target: Option<FocusableArea>,
         focus_trigger: FocusTrigger,
     ) -> bool {
+        self.run_the_focusing_steps_with_outcome(cx, fallback_target, focus_trigger) !=
+            FocusOutcome::NotFocusable
+    }
+
+    /// Runs the focusing steps and reports whether the target was newly focused, already focused,
+    /// or not focusable.
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    pub(crate) fn run_the_focusing_steps_with_outcome(
+        &self,
+        cx: &mut JSContext,
+        fallback_target: Option<FocusableArea>,
+        focus_trigger: FocusTrigger,
+    ) -> FocusOutcome {
         // > 1. If new focus target is not a focusable area, then set new focus target to the result
         // >    of getting the focusable area for new focus target, given focus trigger if it was
         // >    passed.
@@ -373,7 +393,7 @@ impl Node {
             .or(fallback_target)
         );
         if focusable_area.is_none() {
-            return false;
+            return FocusOutcome::NotFocusable;
         }
 
         // > 3. If new focus target is a navigable container with non-null content navigable, then
@@ -382,11 +402,18 @@ impl Node {
         let document = self.owner_document();
         let focusable_area = focusable_area.take().unwrap();
         if focusable_area.dom_anchor(&document).is_inert() {
-            return false;
+            return FocusOutcome::NotFocusable;
         }
 
         // > 5. If new focus target is the currently focused area of a top-level traversable, then
         // >    return.
+        if document
+            .focus_handler()
+            .is_already_focused_or_requested(&focusable_area)
+        {
+            return FocusOutcome::AlreadyFocused;
+        }
+
         // > 6. Let old chain be the current focus chain of the top-level traversable in which new
         // >    focus target finds itself.
         // > 6.1. Let new chain be the focus chain of new focus target.
@@ -398,7 +425,7 @@ impl Node {
         document
             .focus_handler()
             .focus(cx, &focusable_area, focus_trigger);
-        true
+        FocusOutcome::NewlyFocused
     }
 
     /// If this node is a focus navigation scope owner, return the corresponding

@@ -3737,7 +3737,9 @@ impl WebGL2RenderingContextMethods<crate::DomTypeHolder> for WebGL2RenderingCont
         let Some(bits) = BlitFrameBufferFlags::from_bits(mask) else {
             return self.base.webgl_error(InvalidValue);
         };
-        let attributes = self.base.GetContextAttributes().unwrap();
+        let Some(attributes) = self.base.GetContextAttributes() else {
+            return;
+        };
 
         if bits.intersects(BlitFrameBufferFlags::DEPTH_STENCIL) {
             match filter {

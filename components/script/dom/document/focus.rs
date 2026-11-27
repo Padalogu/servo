@@ -11,9 +11,10 @@ use js::context::{JSContext, NoGC};
 use js::gc::RootedGuard;
 use keyboard_types::{KeyboardEvent as KeyboardTypesEvent, Modifiers};
 use script_bindings::cell::DomRefCell;
+use script_bindings::codegen::GenericBindings::ElementBinding::ScrollLogicalPosition;
 use script_bindings::codegen::GenericBindings::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
 use script_bindings::codegen::GenericBindings::ShadowRootBinding::ShadowRootMethods;
-use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
+use script_bindings::codegen::GenericBindings::WindowBinding::{ScrollBehavior, WindowMethods};
 use script_bindings::inheritance::Castable;
 use script_bindings::root::{Dom, DomRoot};
 use servo_base::id::BrowsingContextId;
@@ -25,8 +26,9 @@ use crate::dom::bindings::root::MutNullableDom;
 use crate::dom::focusevent::FocusEventType;
 use crate::dom::html::form_controls::htmlinputelement::HTMLInputElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
-use crate::dom::node::focus::{FocusNavigationScopeOwner, FocusTrigger};
+use crate::dom::node::focus::{FocusNavigationScopeOwner, FocusOutcome, FocusTrigger};
 use crate::dom::types::{Element, EventTarget, FocusEvent, HTMLElement, HTMLIFrameElement, Window};
+use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollRequirement};
 use crate::dom::{Document, Event, EventBubbles, EventCancelable, Node, NodeTraits};
 use crate::realms::enter_auto_realm;
 
@@ -171,6 +173,9 @@ pub(crate) struct DocumentFocusHandler {
     /// <https://html.spec.whatwg.org/multipage/#sequential-focus-navigation-starting-point>
     sequential_focus_navigation_starting_point: MutNullableDom<Node>,
     last_non_script_focus_triggered_by_keyboard: Cell<bool>,
+    pending_focus_scroll: MutNullableDom<Element>,
+    focus_scroll_dirty: Cell<bool>,
+    requested_focus_for_current_area: Cell<bool>,
 }
 
 impl DocumentFocusHandler {
@@ -182,6 +187,9 @@ impl DocumentFocusHandler {
             has_focus: Cell::new(has_focus),
             sequential_focus_navigation_starting_point: Default::default(),
             last_non_script_focus_triggered_by_keyboard: Cell::new(true),
+            pending_focus_scroll: Default::default(),
+            focus_scroll_dirty: Cell::new(false),
+            requested_focus_for_current_area: Cell::new(false),
         }
     }
 
@@ -191,6 +199,100 @@ impl DocumentFocusHandler {
 
     pub(crate) fn set_has_focus(&self, has_focus: bool) {
         self.has_focus.set(has_focus);
+        if !has_focus {
+            self.requested_focus_for_current_area.set(false);
+        }
+    }
+
+    pub(crate) fn is_already_focused_or_requested(&self, area: &FocusableArea) -> bool {
+        *self.focused_area.borrow() == *area &&
+            (self.has_focus.get() || self.requested_focus_for_current_area.get())
+    }
+
+    pub(crate) fn set_pending_focus_scroll(&self, element: Option<&Element>) {
+        self.pending_focus_scroll.set(element);
+    }
+
+    pub(crate) fn take_pending_focus_scroll(&self) -> Option<DomRoot<Element>> {
+        let element = self.pending_focus_scroll.get();
+        if element.is_some() {
+            self.pending_focus_scroll.set(None);
+        }
+        element
+    }
+
+    pub(crate) fn note_scroll(&self) {
+        self.focus_scroll_dirty.set(true);
+    }
+
+    pub(crate) fn clear_focus_scroll_dirty(&self) {
+        self.focus_scroll_dirty.set(false);
+    }
+
+    pub(crate) fn is_focus_scroll_dirty(&self) -> bool {
+        self.focus_scroll_dirty.get()
+    }
+
+    pub(crate) fn scroll_element_into_view_if_needed(
+        &self,
+        cx: &mut JSContext,
+        element: &Element,
+        outcome: FocusOutcome,
+    ) {
+        let scroll_now = match outcome {
+            FocusOutcome::NewlyFocused => {
+                self.set_pending_focus_scroll(None);
+                true
+            },
+            FocusOutcome::AlreadyFocused => {
+                if self.is_focus_scroll_dirty() {
+                    true
+                } else {
+                    self.set_pending_focus_scroll(Some(element));
+                    false
+                }
+            },
+            FocusOutcome::NotFocusable => return,
+        };
+        if scroll_now {
+            let scroll_axis = ScrollAxisState {
+                position: ScrollLogicalPosition::Center,
+                requirement: ScrollRequirement::IfNotVisible,
+            };
+            element.scroll_into_view_with_options(
+                cx,
+                ScrollBehavior::Smooth,
+                scroll_axis,
+                scroll_axis,
+                None,
+                None,
+            );
+            self.clear_focus_scroll_dirty();
+        }
+    }
+
+    pub(crate) fn flush_pending_focus_scroll(&self, cx: &mut JSContext) {
+        let Some(element) = self.take_pending_focus_scroll() else {
+            return;
+        };
+        if !element.upcast::<Node>().is_connected() ||
+            self.focused_area().element() != Some(&*element)
+        {
+            return;
+        }
+        let scroll_axis = ScrollAxisState {
+            position: ScrollLogicalPosition::Center,
+            requirement: ScrollRequirement::IfNotVisible,
+        };
+        element.scroll_into_view_with_options(
+            cx,
+            ScrollBehavior::Smooth,
+            scroll_axis,
+            scroll_axis,
+            None,
+            None,
+        );
+        self.clear_focus_scroll_dirty();
     }
 
     /// Return the element that currently has focus. If `None` is returned the viewport itself has focus.
@@ -221,6 +323,9 @@ impl DocumentFocusHandler {
         if new_focusable_area == *self.focused_area.borrow() {
             return;
         }
+        self.pending_focus_scroll.set(None);
+        self.focus_scroll_dirty.set(false);
+        self.requested_focus_for_current_area.set(false);
         self.window
             .layout()
             .set_force_accessibility_update_if_active();
@@ -351,6 +456,7 @@ impl DocumentFocusHandler {
                         with sequence number {sequence:?} and child \
                         {child_browsing_context_id:?}",
         );
+        self.requested_focus_for_current_area.set(true);
         self.window.send_to_constellation(
             ScriptToConstellationMessage::FocusAncestorBrowsingContextsForFocusingSteps(
                 child_browsing_context_id,

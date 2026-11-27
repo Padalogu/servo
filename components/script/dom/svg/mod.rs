@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 pub(crate) mod svgaelement;
+pub(crate) mod svganimatedstring;
+pub(crate) mod svganimatedtransformlist;
 pub(crate) mod svgcircleelement;
 pub(crate) mod svgdefselement;
 pub(crate) mod svgelement;
@@ -26,5 +28,7 @@ pub(crate) mod svgsymbolelement;
 pub(crate) mod svgtextcontentelement;
 pub(crate) mod svgtextelement;
 pub(crate) mod svgtextpositioningelement;
+pub(crate) mod svgtransform;
+pub(crate) mod svgtransformlist;
 pub(crate) mod svgtspanelement;
 pub(crate) mod svguseelement;

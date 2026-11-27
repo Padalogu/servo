@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, LazyCell};
+use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -85,6 +86,10 @@ pub(crate) struct Painter {
 
     /// Our [`WebViewRenderer`]s, one for every `WebView`.
     pub(crate) webview_renderers: FxHashMap<WebViewId, WebViewRenderer>,
+
+    /// Bounded ring of recently closed `WebViewId`s so late in-flight paint
+    /// messages do not emit spurious `UnknownWebView` warnings.
+    closing_webviews: VecDeque<WebViewId>,
 
     /// Tracks whether or not the view needs to be repainted.
     pub(crate) needs_repaint: Cell<RepaintReason>,
@@ -280,6 +285,7 @@ impl Painter {
             painter_id,
             embedder_to_constellation_sender,
             webview_renderers: Default::default(),
+            closing_webviews: VecDeque::new(),
             rendering_context,
             needs_repaint: Cell::default(),
             pending_frames: Default::default(),
@@ -841,6 +847,10 @@ impl Painter {
             .report_memory(MallocSizeOfOps::new(servo_allocator::usable_size, None))
     }
 
+    pub(crate) fn notify_memory_pressure(&mut self) {
+        self.webrender_api.notify_memory_pressure();
+    }
+
     pub(crate) fn change_running_animations_state(
         &mut self,
         webview_id: WebViewId,
@@ -933,7 +943,14 @@ impl Painter {
         pipeline_id: WebRenderPipelineId,
     ) {
         let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) else {
-            return warn!("Could not find WebView for incoming display list");
+            if self.closing_webviews.contains(&webview_id) {
+                debug!(
+                    "Ignoring initial pipeline transaction for closing WebView: {webview_id:?}"
+                );
+            } else {
+                warn!("Could not find WebView for incoming display list");
+            }
+            return;
         };
 
         let starting_epoch = Epoch(0);
@@ -1013,7 +1030,12 @@ impl Painter {
         epoch: Epoch,
     ) {
         let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) else {
-            return warn!("Could not find WebView for Epoch update.");
+            if self.closing_webviews.contains(&webview_id) {
+                debug!("Ignoring epoch update for closing WebView: {webview_id:?}");
+            } else {
+                warn!("Could not find WebView for Epoch update.");
+            }
+            return;
         };
         webview_renderer
             .ensure_pipeline_details(pipeline_id)
@@ -1047,7 +1069,12 @@ impl Painter {
         );
         let _span = profile_traits::trace_span!("PaintMessage::SendDisplayList").entered();
         let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) else {
-            return warn!("Could not find WebView for incoming display list");
+            if self.closing_webviews.contains(&webview_id) {
+                debug!("Ignoring incoming display list for closing WebView: {webview_id:?}");
+            } else {
+                warn!("Could not find WebView for incoming display list");
+            }
+            return;
         };
 
         let old_scale = webview_renderer.device_pixels_per_page_pixel();
@@ -1308,9 +1335,11 @@ impl Painter {
         webview: Box<dyn WebViewTrait>,
         viewport_details: ViewportDetails,
     ) {
+        let webview_id = webview.id();
+        self.closing_webviews.retain(|&id| id != webview_id);
         let property_binding_key = self.generate_property_binding_key();
         self.webview_renderers
-            .entry(webview.id())
+            .entry(webview_id)
             .or_insert(WebViewRenderer::new(
                 webview,
                 viewport_details,
@@ -1323,9 +1352,14 @@ impl Painter {
 
     pub(crate) fn remove_webview(&mut self, webview_id: WebViewId) {
         let Some(webview_renderer) = self.webview_renderers.remove(&webview_id) else {
-            warn!("Tried removing unknown WebView: {webview_id:?}");
+            if self.closing_webviews.contains(&webview_id) {
+                debug!("Ignoring duplicate remove_webview for closing WebView: {webview_id:?}");
+            } else {
+                warn!("Tried removing unknown WebView: {webview_id:?}");
+            }
             return;
         };
+        record_closing_webview(&mut self.closing_webviews, webview_id);
 
         let mut transaction = Transaction::new();
         for pipeline_id in webview_renderer.pipelines.keys() {
@@ -1545,7 +1579,7 @@ impl Painter {
     }
 
     pub(crate) fn handle_new_webrender_frame_ready(&self, repaint_needed: bool) {
-        if repaint_needed {
+        if repaint_needed && self.pending_frames.get() == 0 {
             self.refresh_cursor()
         }
 
@@ -1711,4 +1745,50 @@ impl SceneBuilderHooks for BoostWebRenderThread {
     fn poke(&self) {}
 
     fn deregister(&self) {}
+}
+
+const MAX_CLOSING_WEBVIEWS: usize = 64;
+
+fn record_closing_webview(closing_webviews: &mut VecDeque<WebViewId>, webview_id: WebViewId) {
+    if closing_webviews.contains(&webview_id) {
+        return;
+    }
+    if closing_webviews.len() >= MAX_CLOSING_WEBVIEWS {
+        closing_webviews.pop_front();
+    }
+    closing_webviews.push_back(webview_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_webviews_ring_bounds_at_64_and_deduplicates() {
+        let painter_id = PainterId::next();
+        let mut ring = VecDeque::new();
+        let ids: Vec<WebViewId> = (0..70).map(|_| WebViewId::new(painter_id)).collect();
+
+        for &id in &ids[..64] {
+            record_closing_webview(&mut ring, id);
+        }
+        assert_eq!(ring.len(), MAX_CLOSING_WEBVIEWS);
+
+        // Duplicate insertion must not grow or evict existing entries.
+        record_closing_webview(&mut ring, ids[0]);
+        assert_eq!(ring.len(), MAX_CLOSING_WEBVIEWS);
+        assert!(ring.contains(&ids[0]));
+
+        // Pushing beyond 64 evicts the oldest entry first.
+        record_closing_webview(&mut ring, ids[64]);
+        assert_eq!(ring.len(), MAX_CLOSING_WEBVIEWS);
+        assert!(!ring.contains(&ids[0]));
+        assert!(ring.contains(&ids[1]));
+        assert!(ring.contains(&ids[64]));
+
+        // Re-adding a WebViewId removes it from closing_webviews via retain.
+        ring.retain(|&id| id != ids[1]);
+        assert!(!ring.contains(&ids[1]));
+        assert_eq!(ring.len(), MAX_CLOSING_WEBVIEWS - 1);
+    }
 }

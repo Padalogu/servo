@@ -5,14 +5,21 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use js::realm::CurrentRealm;
 use script_bindings::reflector::reflect_dom_object;
+use servo_constellation_traits::ScriptToConstellationMessage;
+use stylo_atoms::Atom;
 
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::WakeLockBinding::{
     WakeLockSentinelMethods, WakeLockType,
 };
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::promise::{Promise, RootedPromise};
 
 /// <https://w3c.github.io/screen-wake-lock/#the-wakelocksentinel-interface>
 #[dom_struct]
@@ -50,4 +57,20 @@ impl WakeLockSentinelMethods<crate::DomTypeHolder> for WakeLockSentinel {
     fn Type(&self) -> WakeLockType {
         self.type_
     }
+
+    /// <https://w3c.github.io/screen-wake-lock/#the-release-method>
+    fn Release(&self, cx: &mut CurrentRealm) -> RootedPromise {
+        let promise = Promise::new_in_realm(cx);
+        if !self.released.replace(true) {
+            self.global().as_window().send_to_constellation(
+                ScriptToConstellationMessage::ReleaseWakeLock(self.type_.convert()),
+            );
+            self.upcast::<EventTarget>()
+                .fire_event(cx, Atom::from("release"));
+        }
+        promise.resolve_native(cx, &());
+        promise
+    }
+
+    event_handler!(release, GetOnrelease, SetOnrelease);
 }

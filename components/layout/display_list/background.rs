@@ -166,28 +166,20 @@ impl<'a> BackgroundPainter<'a> {
     }
 }
 
-pub(super) fn layout_layer(
-    fragment_builder: &super::BuilderForBoxFragment,
-    painter: &BackgroundPainter,
-    builder: &mut DisplayListBuilder,
-    state: &TraversalState,
-    layer_index: usize,
+pub(super) fn compute_tile_size(
+    size: &Size,
+    positioning_area_size: units::LayoutSize,
     natural_sizes: NaturalSizes,
-) -> Option<BackgroundLayer> {
-    let painting_area = painter.painting_area(fragment_builder, builder, layer_index);
-    let positioning_area = painter.positioning_area(fragment_builder, builder, layer_index);
-    let common =
-        painter.common_properties(fragment_builder, builder, state, layer_index, painting_area);
-
+) -> units::LayoutSize {
     // https://drafts.csswg.org/css-backgrounds/#background-size
     enum ContainOrCover {
         Contain,
         Cover,
     }
     let size_contain_or_cover = |background_size| {
-        let mut tile_size = positioning_area.size();
+        let mut tile_size = positioning_area_size;
         if let Some(natural_ratio) = natural_sizes.ratio {
-            let positioning_ratio = positioning_area.size().width / positioning_area.size().height;
+            let positioning_ratio = positioning_area_size.width / positioning_area_size.height;
             // Whether the tile width (as opposed to height)
             // is scaled to that of the positioning area
             let fit_width = match background_size {
@@ -204,16 +196,15 @@ pub(super) fn layout_layer(
         tile_size
     };
 
-    let b = painter.style.get_background();
-    let mut tile_size = match get_cyclic(&b.background_size.0, layer_index) {
+    match size {
         Size::Contain => size_contain_or_cover(ContainOrCover::Contain),
         Size::Cover => size_contain_or_cover(ContainOrCover::Cover),
         Size::ExplicitSize { width, height } => {
             let mut width = width.non_auto().map(|lp| {
-                lp.0.to_used_value(Au::from_f32_px(positioning_area.size().width))
+                lp.0.to_used_value(Au::from_f32_px(positioning_area_size.width))
             });
             let mut height = height.non_auto().map(|lp| {
-                lp.0.to_used_value(Au::from_f32_px(positioning_area.size().height))
+                lp.0.to_used_value(Au::from_f32_px(positioning_area_size.height))
             });
 
             if width.is_none() && height.is_none() {
@@ -232,7 +223,7 @@ pub(super) fn layout_layer(
                         natural_height
                     } else {
                         // Treated as 100%
-                        Au::from_f32_px(positioning_area.size().height)
+                        Au::from_f32_px(positioning_area_size.height)
                     };
                     units::LayoutSize::new(w.to_f32_px(), h.to_f32_px())
                 },
@@ -243,7 +234,7 @@ pub(super) fn layout_layer(
                         natural_width
                     } else {
                         // Treated as 100%
-                        Au::from_f32_px(positioning_area.size().width)
+                        Au::from_f32_px(positioning_area_size.width)
                     };
                     units::LayoutSize::new(w.to_f32_px(), h.to_f32_px())
                 },
@@ -251,7 +242,28 @@ pub(super) fn layout_layer(
                 (None, None) => size_contain_or_cover(ContainOrCover::Contain),
             }
         },
-    };
+    }
+}
+
+pub(super) fn layout_layer(
+    fragment_builder: &super::BuilderForBoxFragment,
+    painter: &BackgroundPainter,
+    builder: &mut DisplayListBuilder,
+    state: &TraversalState,
+    layer_index: usize,
+    natural_sizes: NaturalSizes,
+) -> Option<BackgroundLayer> {
+    let painting_area = painter.painting_area(fragment_builder, builder, layer_index);
+    let positioning_area = painter.positioning_area(fragment_builder, builder, layer_index);
+    let common =
+        painter.common_properties(fragment_builder, builder, state, layer_index, painting_area);
+
+    let b = painter.style.get_background();
+    let mut tile_size = compute_tile_size(
+        get_cyclic(&b.background_size.0, layer_index),
+        positioning_area.size(),
+        natural_sizes,
+    );
 
     if tile_size.width == 0.0 || tile_size.height == 0.0 {
         return None;

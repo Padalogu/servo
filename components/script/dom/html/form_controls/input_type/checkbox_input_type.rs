@@ -7,10 +7,10 @@ use script_bindings::codegen::GenericBindings::HTMLInputElementBinding::HTMLInpu
 use script_bindings::domstring::DOMString;
 use script_bindings::inheritance::Castable;
 
+use crate::dom::element::Element;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::form_controls::htmlinputelement::{HTMLInputElement, InputActivationState};
-use crate::dom::html::form_controls::input_type::text_value_widget::TextValueWidget;
 use crate::dom::html::form_controls::input_type::{
     SpecificInputActivationType, SpecificInputType, ValueChangeEvents,
 };
@@ -18,10 +18,7 @@ use crate::dom::input_type::text_input_widget::TextInputWidget;
 use crate::dom::node::Node;
 
 #[derive(Default, JSTraceable, MallocSizeOf, PartialEq)]
-#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
-pub(crate) struct CheckboxInputType {
-    text_value_widget: DomRefCell<TextValueWidget>,
-}
+pub(crate) struct CheckboxInputType();
 
 #[derive(Clone, Copy)]
 pub(crate) struct CheckboxInputActivation;
@@ -67,9 +64,9 @@ impl SpecificInputType for CheckboxInputType {
     }
 
     fn update_shadow_tree(&self, cx: &mut JSContext, input: &HTMLInputElement) {
-        self.text_value_widget
-            .borrow()
-            .update_shadow_tree(cx, input)
+        if let Some(shadow_root) = input.upcast::<Element>().shadow_root() {
+            Node::replace_all(cx, None, shadow_root.upcast());
+        }
     }
 }
 

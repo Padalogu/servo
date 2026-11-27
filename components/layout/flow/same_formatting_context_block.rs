@@ -179,6 +179,7 @@ impl SameFormattingContextBlock {
             block_stretch_size,
             justify_self,
             automatic_block_size,
+            aspect_ratio_block_size,
             ..
         } = solve_containing_block_padding_and_border_for_in_flow_box(
             layout_context,
@@ -346,14 +347,22 @@ impl SameFormattingContextBlock {
             content_block_size += collapsible_margins_in_children.end.solve();
         }
 
-        let block_size = block_sizes.resolve(
-            LogicalAxis::Block,
-            automatic_block_size,
-            Au::zero,
-            block_stretch_size,
-            || content_block_size.into(),
-            false, /* is_table */
-        );
+        let block_size = if let Some(aspect_ratio_block_size) = aspect_ratio_block_size {
+            aspect_ratio_block_size.resolve_with_content_size(
+                &block_sizes,
+                block_stretch_size,
+                content_block_size,
+            )
+        } else {
+            block_sizes.resolve(
+                LogicalAxis::Block,
+                automatic_block_size,
+                Au::zero,
+                block_stretch_size,
+                || content_block_size.into(),
+                false, /* is_table */
+            )
+        };
 
         // If the final block size is different than the intrinsic size of the contents,
         // then we can't actually collapse the end margins. This can happen due to min

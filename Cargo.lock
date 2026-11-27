@@ -9091,6 +9091,7 @@ dependencies = [
 name = "servo-media-player"
 version = "0.8.0"
 dependencies = [
+ "aes",
  "malloc_size_of_derive",
  "serde",
  "servo-base",

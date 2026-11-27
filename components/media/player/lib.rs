@@ -9,8 +9,10 @@ extern crate servo_media_streams as streams;
 extern crate servo_media_traits;
 
 pub mod audio;
+pub mod cenc;
 pub mod context;
 pub mod metadata;
+pub mod mse;
 pub mod video;
 
 use serde::{Deserialize, Serialize};
@@ -86,6 +88,41 @@ pub enum PlayerEvent {
     /// The player has performed a seek to the given time offset in seconds.
     SeekDone(f64),
     StateChanged(PlaybackState),
+    /// MSE player requests media data starting at the given presentation time in seconds.
+    MseSeek(f64),
+    /// MSE player needs more data for the given SourceBuffer ID.
+    MseNeedData(u32),
+    /// MSE player has enough buffered data for the given SourceBuffer ID.
+    MseEnoughData(u32),
+    /// EME: initialization data encountered in the media container.
+    Encrypted {
+        init_data_type: String,
+        init_data: Vec<u8>,
+    },
+    /// EME: player is waiting for a decryption key to continue playback.
+    WaitingForKey,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum MseEndOfStreamError {
+    Network,
+    Decode,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum MseTrackKind {
+    Audio,
+    Video,
+    Text,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MseTrackDescriptor {
+    pub source_buffer_id: u32,
+    pub track_id: u64,
+    pub kind: MseTrackKind,
+    pub mime_type: String,
+    pub codec: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -94,6 +131,8 @@ pub enum StreamType {
     Stream,
     /// The stream is seekable.
     Seekable,
+    /// Media Source Extensions (MSE) segmented source.
+    MediaSource,
 }
 
 pub trait Player: Send + MediaInstance {
@@ -131,4 +170,54 @@ pub trait Player: Send + MediaInstance {
     fn render_use_gl(&self) -> bool;
     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+
+    /// Register a new MSE SourceBuffer with the player.
+    fn mse_add_source_buffer(&self, _id: u32, _mime_type: &str) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Remove an MSE SourceBuffer from the player.
+    fn mse_remove_source_buffer(&self, _id: u32) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Push container segment bytes for the given MSE SourceBuffer ID.
+    fn mse_push_data(&self, _source_buffer_id: u32, _data: Vec<u8>) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Flush queued data for the given MSE SourceBuffer ID (e.g., on seek or remove).
+    fn mse_flush_track(&self, _source_buffer_id: u32) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Signal MSE end-of-stream with an optional error.
+    fn mse_end_of_stream(&self, _error: Option<MseEndOfStreamError>) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Update the MSE media duration in seconds (`None` for unknown/live).
+    fn mse_set_duration(&self, _duration: Option<f64>) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Set the MSE live seekable range in seconds.
+    fn mse_set_live_seekable_range(&self, _start: f64, _end: f64) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Commit parsed MSE track descriptors so playback/demuxing can transition to ready.
+    fn mse_commit_tracks(&self, _tracks: &[MseTrackDescriptor]) -> Result<(), PlayerError> {
+        Err(PlayerError::Backend("MSE not supported".into()))
+    }
+
+    /// Attach or detach a ClearKey decryption key store for EME playback.
+    fn set_clearkey_store(&self, _store: Option<cenc::ClearKeyStore>) -> Result<(), PlayerError> {
+        Ok(())
+    }
+
+    /// Notify the player that new decryption keys were added to the ClearKeyStore.
+    fn notify_keys_updated(&self) -> Result<(), PlayerError> {
+        Ok(())
+    }
 }

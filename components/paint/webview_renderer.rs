@@ -434,7 +434,17 @@ impl WebViewRenderer {
                 }
                 .or_else(|| self.hit_test(render_api, point).into_iter().nth(0));
                 if hit_test_result.is_none() {
-                    warn!("Empty hit test result for input event, ignoring.");
+                    if self.hidden ||
+                        self.root_pipeline_id
+                            .is_none_or(|pid| !self.pipelines.contains_key(&pid))
+                    {
+                        debug!(
+                            "Empty hit test result for hidden or unready WebView {:?}, ignoring.",
+                            self.id
+                        );
+                    } else {
+                        warn!("Empty hit test result for input event, ignoring.");
+                    }
                     return false;
                 }
                 hit_test_result
@@ -482,6 +492,16 @@ impl WebViewRenderer {
         repaint_reason: &Cell<RepaintReason>,
         event_and_id: InputEventAndId,
     ) -> bool {
+        if self.hidden || self.root_pipeline_id.is_none() {
+            debug!(
+                "Ignoring input event for hidden or unready WebView {:?} (hidden={}, has_root={})",
+                self.id,
+                self.hidden,
+                self.root_pipeline_id.is_some(),
+            );
+            return false;
+        }
+
         if let InputEvent::Touch(touch_event) = event_and_id.event {
             return self.on_touch_event(render_api, repaint_reason, touch_event, event_and_id.id);
         }

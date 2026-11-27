@@ -74,7 +74,7 @@ use style::device::Device;
 use style::dom::OpaqueNode;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::style_structs::Font;
-use style::properties::{ComputedValues, PropertyId};
+use style::properties::{ComputedValues, LonghandId, PropertyId, ShorthandId};
 use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
 use style::str::char_is_whitespace;
 use style::stylesheets::{DocumentStyleSheet, Stylesheet};
@@ -169,6 +169,8 @@ pub struct HTMLCanvasData {
 pub struct SVGElementData<'dom> {
     /// The SVG's XML source represented as a base64 encoded `data:` url.
     pub source: Option<Result<ServoUrl, ()>>,
+    /// Whether the serialized XML source needs to be regenerated from the live SVG DOM.
+    pub needs_serialization: bool,
     pub width: Option<&'dom AttrValue>,
     pub height: Option<&'dom AttrValue>,
     pub svg_id: Uuid,
@@ -402,6 +404,9 @@ pub trait Layout {
         node: Option<TrustedNodeAddress>,
         flags: ScrollContainerQueryFlags,
     ) -> Option<ScrollContainerResponse>;
+    fn can_serve_cached_resolved_style(&self) -> bool {
+        false
+    }
     fn query_resolved_style(
         &self,
         node: TrustedNodeAddress,
@@ -609,6 +614,70 @@ pub enum QueryMsg {
     AccessKitNodeQuery,
 }
 
+impl QueryMsg {
+    /// Returns whether `getComputedStyle` for `property` requires box/fragment tree layout
+    /// (used values) rather than computed styles alone. Kept in sync with
+    /// `process_resolved_style_request()` in `components/layout/query.rs`.
+    pub fn resolved_style_needs_layout(property: &PropertyId) -> bool {
+        let PropertyId::NonCustom(non_custom) = property else {
+            return false;
+        };
+        let is_layout_longhand = |longhand: LonghandId| {
+            matches!(
+                longhand,
+                LonghandId::Top |
+                    LonghandId::Right |
+                    LonghandId::Bottom |
+                    LonghandId::Left |
+                    LonghandId::InsetInlineStart |
+                    LonghandId::InsetInlineEnd |
+                    LonghandId::InsetBlockStart |
+                    LonghandId::InsetBlockEnd |
+                    LonghandId::Width |
+                    LonghandId::Height |
+                    LonghandId::InlineSize |
+                    LonghandId::BlockSize |
+                    LonghandId::MinWidth |
+                    LonghandId::MinHeight |
+                    LonghandId::MinInlineSize |
+                    LonghandId::MinBlockSize |
+                    LonghandId::MarginTop |
+                    LonghandId::MarginRight |
+                    LonghandId::MarginBottom |
+                    LonghandId::MarginLeft |
+                    LonghandId::MarginInlineStart |
+                    LonghandId::MarginInlineEnd |
+                    LonghandId::MarginBlockStart |
+                    LonghandId::MarginBlockEnd |
+                    LonghandId::PaddingTop |
+                    LonghandId::PaddingRight |
+                    LonghandId::PaddingBottom |
+                    LonghandId::PaddingLeft |
+                    LonghandId::PaddingInlineStart |
+                    LonghandId::PaddingInlineEnd |
+                    LonghandId::PaddingBlockStart |
+                    LonghandId::PaddingBlockEnd |
+                    LonghandId::Transform |
+                    LonghandId::GridTemplateRows |
+                    LonghandId::GridTemplateColumns
+            )
+        };
+        match non_custom.longhand_or_shorthand() {
+            Ok(longhand) => is_layout_longhand(longhand),
+            Err(ShorthandId::All) => true,
+            Err(shorthand) => shorthand.longhands().any(is_layout_longhand),
+        }
+    }
+
+    pub fn needs_layout(&self) -> bool {
+        match self {
+            Self::StyleQuery | Self::ResolvedFontStyleQuery => false,
+            Self::ResolvedStyleQuery(property) => Self::resolved_style_needs_layout(property),
+            _ => true,
+        }
+    }
+}
+
 /// The goal of a reflow request.
 ///
 /// Please do not add any other types of reflows. In general, all reflow should
@@ -628,6 +697,15 @@ pub enum ReflowGoal {
     /// remain untouched. Layout will forward whether the element is scrolled through
     /// [ReflowResult].
     UpdateScrollNode(ExternalScrollId, LayoutVector2D),
+}
+
+impl ReflowGoal {
+    pub fn needs_layout(&self) -> bool {
+        match self {
+            Self::LayoutQuery(query) => query.needs_layout(),
+            Self::UpdateScrollNode(..) | Self::UpdateTheRendering => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, MallocSizeOf)]

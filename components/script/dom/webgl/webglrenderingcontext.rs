@@ -34,6 +34,7 @@ use servo_canvas_traits::webgl::{
     WebGLProgramId, WebGLResult, WebGLSLVersion, WebGLVersion, YAxisTreatment, webgl_channel,
 };
 use servo_config::pref;
+use stylo_atoms::Atom;
 use webrender_api::ImageKey;
 
 use crate::canvas_context::{CanvasContext, HTMLCanvasElementOrOffscreenCanvas};
@@ -57,6 +58,7 @@ use crate::dom::bindings::codegen::UnionTypes::{
 use crate::dom::bindings::conversions::DerivedFrom;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomOnceCell, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
@@ -211,6 +213,8 @@ pub(crate) struct WebGLRenderingContext {
     textures: Textures,
     #[no_trace]
     api_type: GlType,
+    context_lost: Cell<bool>,
+    lost_via_extension: Cell<bool>,
     droppable: DroppableWebGLRenderingContext,
 }
 
@@ -283,6 +287,8 @@ impl WebGLRenderingContext {
                 current_vao_webgl2: Default::default(),
                 textures: Textures::new(max_combined_texture_image_units),
                 api_type: ctx_data.api_type,
+                context_lost: Cell::new(false),
+                lost_via_extension: Cell::new(false),
                 droppable: DroppableWebGLRenderingContext {
                     webgl_sender: ctx_data.sender,
                 },
@@ -365,6 +371,87 @@ impl WebGLRenderingContext {
 
     pub(crate) fn api_type(&self) -> GlType {
         self.api_type
+    }
+
+    pub(crate) fn is_context_lost(&self) -> bool {
+        self.context_lost.get()
+    }
+
+    pub(crate) fn lose_context(&self) {
+        if self.context_lost.get() {
+            self.webgl_error(InvalidOperation);
+            return;
+        }
+        self.context_lost.set(true);
+        self.lost_via_extension.set(true);
+        self.webgl_error(ContextLost);
+
+        let this = Trusted::new(self);
+        self.global()
+            .task_manager()
+            .dom_manipulation_task_source()
+            .queue(task!(webgl_context_lost: move |cx| {
+                let this = this.root();
+                this.dispatch_context_event(
+                    cx,
+                    Atom::from("webglcontextlost"),
+                    EventCancelable::Cancelable,
+                );
+            }));
+    }
+
+    pub(crate) fn restore_context(&self) {
+        if !self.context_lost.get() || !self.lost_via_extension.get() {
+            self.webgl_error(InvalidOperation);
+            return;
+        }
+
+        let this = Trusted::new(self);
+        self.global()
+            .task_manager()
+            .dom_manipulation_task_source()
+            .queue(task!(webgl_context_restored: move |cx| {
+                let this = this.root();
+                if !this.context_lost.get() || !this.lost_via_extension.get() {
+                    return;
+                }
+                this.context_lost.set(false);
+                this.lost_via_extension.set(false);
+                this.last_error.set(None);
+                this.dispatch_context_event(
+                    cx,
+                    Atom::from("webglcontextrestored"),
+                    EventCancelable::NotCancelable,
+                );
+            }));
+    }
+
+    fn dispatch_context_event(
+        &self,
+        cx: &mut JSContext,
+        event_type: Atom,
+        cancelable: EventCancelable,
+    ) {
+        let global = self.global();
+        let Some(window) = global.downcast::<Window>() else {
+            return;
+        };
+        let event = WebGLContextEvent::new(
+            cx,
+            window,
+            event_type,
+            EventBubbles::DoesNotBubble,
+            cancelable,
+            DOMString::new(),
+        );
+        match self.canvas {
+            HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                event.upcast::<Event>().fire(cx, canvas.upcast());
+            },
+            HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(ref canvas) => {
+                event.upcast::<Event>().fire(cx, canvas.upcast());
+            },
+        }
     }
 
     pub(crate) fn limits(&self) -> &GLLimits {
@@ -2657,6 +2744,10 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
 
     /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.2>
     fn GetContextAttributes(&self) -> Option<WebGLContextAttributes> {
+        if self.context_lost.get() {
+            return None;
+        }
+
         let (sender, receiver) = webgl_channel().unwrap();
 
         // If the send does not succeed, assume context lost
@@ -2686,11 +2777,14 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
 
     /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.13>
     fn IsContextLost(&self) -> bool {
-        false
+        self.context_lost.get()
     }
 
     /// <https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.14>
     fn GetSupportedExtensions(&self) -> Option<Vec<DOMString>> {
+        if self.context_lost.get() {
+            return None;
+        }
         self.extension_manager
             .init_once(|| self.get_gl_extensions());
         let extensions = self.extension_manager.get_supported_extensions();
@@ -2709,6 +2803,9 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
         name: DOMString,
         rval: MutableHandleObject,
     ) {
+        if self.context_lost.get() {
+            return;
+        }
         self.extension_manager
             .init_once(|| self.get_gl_extensions());
         self.extension_manager
@@ -3056,7 +3153,9 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
                 None => None,
             },
             None => {
-                let attrs = self.GetContextAttributes().unwrap();
+                let Some(attrs) = self.GetContextAttributes() else {
+                    return;
+                };
                 Some(if attrs.alpha {
                     TexFormat::RGBA
                 } else {

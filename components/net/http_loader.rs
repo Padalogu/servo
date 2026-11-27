@@ -119,6 +119,26 @@ pub enum HttpCacheEntryState {
     PendingStore(usize),
 }
 
+const MAX_CONCURRENT_REQUESTS_PER_HOST: usize = 8;
+
+pub struct HostRequestGate {
+    warmed: AtomicBool,
+    warm_lock: tokio::sync::Mutex<()>,
+    in_flight: StdArc<tokio::sync::Semaphore>,
+}
+
+impl Default for HostRequestGate {
+    fn default() -> Self {
+        Self {
+            warmed: AtomicBool::new(false),
+            warm_lock: tokio::sync::Mutex::new(()),
+            in_flight: StdArc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_REQUESTS_PER_HOST,
+            )),
+        }
+    }
+}
+
 pub struct HttpState {
     pub hsts_list: RwLock<HstsList>,
     pub cookie_jar: RwLock<CookieStorage>,
@@ -129,9 +149,24 @@ pub struct HttpState {
     pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    pub host_gates: Mutex<FxHashMap<String, StdArc<HostRequestGate>>>,
 }
 
 impl HttpState {
+    pub(crate) fn host_gate(&self, url: &ServoUrl) -> StdArc<HostRequestGate> {
+        let key = format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str().unwrap_or(""),
+            url.port_or_known_default().unwrap_or(0)
+        );
+        self.host_gates
+            .lock()
+            .entry(key)
+            .or_default()
+            .clone()
+    }
+
     pub(crate) fn memory_reports(&self, suffix: &str, ops: &mut MallocSizeOfOps) -> Vec<Report> {
         vec![
             Report {
@@ -184,7 +219,7 @@ impl HttpState {
 }
 
 /// Step 11 of <https://fetch.spec.whatwg.org/#concept-fetch>.
-pub(crate) fn set_default_accept(request: &mut Request) {
+pub fn set_default_accept(request: &mut Request) {
     // Step 11. If request’s header list does not contain `Accept`, then:
     if request.headers.contains_key(header::ACCEPT) {
         return;
@@ -201,7 +236,7 @@ pub(crate) fn set_default_accept(request: &mut Request) {
                 DOCUMENT_ACCEPT_HEADER_VALUE
             },
             Destination::Image => {
-                HeaderValue::from_static("image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+                HeaderValue::from_static("image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
             },
             Destination::Json => HeaderValue::from_static("application/json,*/*;q=0.5"),
             Destination::Style => HeaderValue::from_static("text/css,*/*;q=0.1"),
@@ -536,7 +571,7 @@ async fn obtain_response(
     request_id: Option<&Uuid>,
     context: &FetchContext,
     fetch_terminated: UnboundedSender<bool>,
-) -> Result<(HyperResponse<Decoder>, DevtoolsResponse), NetworkError> {
+) -> Result<(HyperResponse<Decoder>, DevtoolsResponse, tokio::sync::OwnedSemaphorePermit), NetworkError> {
     #[cfg(feature = "devtools")]
     let (destination, pipeline_id, browsing_context_id) = {
         let request = &fetch_params.request;
@@ -736,15 +771,49 @@ async fn obtain_response(
             )
         });
 
-    #[cfg(feature = "tracing")]
-    {
-        client_future.instrument(trace_span!("HyperRequest")).await
+    let gate = context.state.host_gate(url);
+    let request_timeout =
+        Duration::from_secs(pref!(network_connection_timeout).clamp(15, 25));
+
+    let await_request = |fut| async move {
+        match tokio::time::timeout(request_timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                warn!("HTTP request timed out");
+                Err(NetworkError::ConnectionFailure)
+            },
+        }
+    };
+
+    if !gate.warmed.load(Ordering::Acquire) {
+        let _warm_guard = gate.warm_lock.lock().await;
+        if !gate.warmed.load(Ordering::Acquire) {
+            let permit = gate
+                .in_flight
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| NetworkError::ConnectionFailure)?;
+            #[cfg(feature = "tracing")]
+            let res = await_request(client_future.instrument(trace_span!("HyperRequest"))).await?;
+            #[cfg(not(feature = "tracing"))]
+            let res = await_request(client_future).await?;
+            gate.warmed.store(true, Ordering::Release);
+            return Ok((res.0, res.1, permit));
+        }
     }
 
+    let permit = gate
+        .in_flight
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| NetworkError::ConnectionFailure)?;
+    #[cfg(feature = "tracing")]
+    let res = await_request(client_future.instrument(trace_span!("HyperRequest"))).await?;
     #[cfg(not(feature = "tracing"))]
-    {
-        client_future.await
-    }
+    let res = await_request(client_future).await?;
+    Ok((res.0, res.1, permit))
 }
 
 /// Setup the callback mechanism to forward chunks from the request received to the `chunk_requester`.
@@ -1592,101 +1661,124 @@ async fn http_network_or_cache_fetch(
     }
 
     // TODO(#33616) Step 8.22 If there’s a proxy-authentication entry, use it as appropriate.
-    let should_wait = {
-        // Enter critical section on cache entry.
-        let mut cache_guard = block_for_cache_ready(
-            context,
-            http_request,
-            done_chan,
-            &mut revalidating_flag,
-            &mut response,
-        )
-        .await;
-
-        // TODO(#33616): Step 9. If aborted, then return the appropriate network error for fetchParams.
-
-        // Step 10. If response is null, then:
-        if response.is_none() {
-            // Step 10.1 If httpRequest’s cache mode is "only-if-cached", then return a network error.
-            if http_request.cache_mode == CacheMode::OnlyIfCached {
-                // Exit critical section of cache entry.
-                return Response::network_error(NetworkError::CacheError);
-            }
-
-            // Step 10.2 Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams,
-            // includeCredentials, and isNewConnectionFetch.
-            drop(cache_guard);
-            let forward_response =
-                http_network_fetch(http_fetch_params, include_credentials, done_chan, context)
-                    .await;
-
-            let http_request = &mut http_fetch_params.request;
-            let request_key = CacheKey::new(http_request);
-            cache_guard = context
-                .state
-                .http_cache
-                .get_or_guard(request_key.clone())
+    const MAX_INFLIGHT_ABORT_RETRIES: usize = 2;
+    let mut inflight_abort_retries = 0;
+    loop {
+        let http_request = &mut http_fetch_params.request;
+        let should_wait =
+            if http_request.cache_mode == CacheMode::NoStore && http_request.method.is_safe() {
+                response = Some(
+                    http_network_fetch(http_fetch_params, include_credentials, done_chan, context)
+                        .await,
+                );
+                false
+            } else {
+                // Enter critical section on cache entry.
+                let mut cache_guard = block_for_cache_ready(
+                    context,
+                    http_request,
+                    done_chan,
+                    &mut revalidating_flag,
+                    &mut response,
+                )
                 .await;
-            // Step 10.3 If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399,
-            // inclusive, invalidate appropriate stored responses in httpCache, as per the
-            // "Invalidating Stored Responses" chapter of HTTP Caching, and set storedResponse to null.
-            if forward_response.status.in_range(200..=399) && !http_request.method.is_safe() {
-                if let Some(guard) = cache_guard.try_as_mut() {
-                    invalidate_cached_resources(guard);
-                }
-                context
-                    .state
-                    .http_cache
-                    .invalidate_related_urls(http_request, &forward_response, &request_key)
-                    .await;
-            }
 
-            // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
-            if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
-                // Ensure done_chan is None,
-                // since the network response will be replaced by the revalidated stored one.
-                *done_chan = None;
-                if let Some(guard) = cache_guard.try_as_mut() {
-                    response = refresh(http_request, forward_response.clone(), done_chan, guard);
-                }
+                // TODO(#33616): Step 9. If aborted, then return the appropriate network error for fetchParams.
 
-                match &mut response {
-                    Some(response) => {
-                        response.cache_state = CacheState::Validated;
-                    },
-                    // The validated entry was no longer in the cache when we expected it to be.
-                    None => {
-                        *done_chan = None;
+                // Step 10. If response is null, then:
+                if response.is_none() {
+                    // Step 10.1 If httpRequest’s cache mode is "only-if-cached", then return a network error.
+                    if http_request.cache_mode == CacheMode::OnlyIfCached {
+                        // Exit critical section of cache entry.
                         return Response::network_error(NetworkError::CacheError);
-                    },
-                }
-            }
+                    }
 
-            // Step 10.5 If response is null, then:
+                    // Step 10.2 Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams,
+                    // includeCredentials, and isNewConnectionFetch.
+                    drop(cache_guard);
+                    let forward_response =
+                        http_network_fetch(http_fetch_params, include_credentials, done_chan, context)
+                            .await;
+
+                    let http_request = &mut http_fetch_params.request;
+                    let request_key = CacheKey::new(http_request);
+                    cache_guard = context
+                        .state
+                        .http_cache
+                        .get_or_guard(request_key.clone())
+                        .await;
+                    // Step 10.3 If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399,
+                    // inclusive, invalidate appropriate stored responses in httpCache, as per the
+                    // "Invalidating Stored Responses" chapter of HTTP Caching, and set storedResponse to null.
+                    if forward_response.status.in_range(200..=399) && !http_request.method.is_safe() {
+                        if let Some(guard) = cache_guard.try_as_mut() {
+                            invalidate_cached_resources(guard);
+                        }
+                        context
+                            .state
+                            .http_cache
+                            .invalidate_related_urls(http_request, &forward_response, &request_key)
+                            .await;
+                    }
+
+                    // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
+                    if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
+                        // Ensure done_chan is None,
+                        // since the network response will be replaced by the revalidated stored one.
+                        *done_chan = None;
+                        if let Some(guard) = cache_guard.try_as_mut() {
+                            response = refresh(http_request, forward_response.clone(), done_chan, guard);
+                        }
+
+                        match &mut response {
+                            Some(response) => {
+                                response.cache_state = CacheState::Validated;
+                            },
+                            // The validated entry was no longer in the cache when we expected it to be.
+                            None => {
+                                *done_chan = None;
+                                return Response::network_error(NetworkError::CacheError);
+                            },
+                        }
+                    }
+
+                    // Step 10.5 If response is null, then:
+                    if response.is_none() {
+                        // Step 10.5.1 Set response to forwardResponse.
+                        let forward_response = response.insert(forward_response);
+
+                        // Per https://httpwg.org/specs/rfc9111.html#response.cacheability we must not cache responses
+                        // if the No-Store directive is present
+                        if http_request.cache_mode != CacheMode::NoStore {
+                            // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
+                            //             "Storing Responses in Caches" chapter of HTTP Caching.
+                            cache_guard.insert(http_request, forward_response);
+                        }
+                    }
+                    false
+                } else {
+                    true
+                }
+            }; // Exit Critical Section on cache entry
+
+        if should_wait {
+            // If the cache constructed a response, and that is still receiving from the network,
+            // we must wait for it to finish in case it is still receiving from the network.
+            // Note: this means only the fetch from which the original network response originated
+            // will be able to stream it; all others receive a cached response in one chunk.
+            wait_for_inflight_requests(done_chan, &mut response).await;
             if response.is_none() {
-                // Step 10.5.1 Set response to forwardResponse.
-                let forward_response = response.insert(forward_response);
-
-                // Per https://httpwg.org/specs/rfc9111.html#response.cacheability we must not cache responses
-                // if the No-Store directive is present
-                if http_request.cache_mode != CacheMode::NoStore {
-                    // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
-                    //             "Storing Responses in Caches" chapter of HTTP Caching.
-                    cache_guard.insert(http_request, forward_response);
+                if context.cancellation_listener.cancelled() {
+                    return Response::network_error(NetworkError::LoadCancelled);
                 }
+                if inflight_abort_retries < MAX_INFLIGHT_ABORT_RETRIES {
+                    inflight_abort_retries += 1;
+                    continue;
+                }
+                return Response::network_error(NetworkError::ConnectionFailure);
             }
-            false
-        } else {
-            true
         }
-    }; // Exit Critical Section on cache entry
-
-    if should_wait {
-        // If the cache constructed a response, and that is still receiving from the network,
-        // we must wait for it to finish in case it is still receiving from the network.
-        // Note: this means only the fetch from which the original network response originated
-        // will be able to stream it; all others receive a cached response in one chunk.
-        wait_for_inflight_requests(done_chan, &mut response).await;
+        break;
     }
 
     let http_request = &mut http_fetch_params.request;
@@ -1993,14 +2085,28 @@ async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut 
         loop {
             match ch.1.recv().await {
                 Some(Data::ContentLength(_)) | Some(Data::Payload(_)) | Some(Data::Error(_)) => {},
-                Some(Data::Done) => break, // Return the full response as if it was initially cached as such.
+                Some(Data::Done) => {
+                    if response
+                        .as_ref()
+                        .is_some_and(|r| r.aborted.load(Ordering::Acquire))
+                    {
+                        *response = None;
+                    }
+                    break; // Return the full response unless the producer aborted.
+                },
                 Some(Data::Cancelled) => {
-                    // The response was cancelled while the fetch was ongoing.
+                    // The response was cancelled or aborted while the fetch was ongoing.
+                    *response = None;
                     break;
                 },
                 None => panic!("HTTP cache should always send Done or Cancelled"),
             }
         }
+    } else if response
+        .as_ref()
+        .is_some_and(|r| r.aborted.load(Ordering::Acquire))
+    {
+        *response = None;
     }
     // Set done_chan back to None, it's cache-related usefulness ends here.
     *done_chan = None;
@@ -2205,7 +2311,7 @@ async fn http_network_fetch(
     // Step 6. Let newConnection be "yes" if forceNewConnection is true; otherwise "no".
 
     // Step 7. Switch on request’s mode:
-    let (response_stream, msg) = match &request.mode {
+    let (response_stream, msg, host_permit) = match &request.mode {
         // Let connection be the result of obtaining a WebSocket connection, given request’s current URL.
         RequestMode::WebSocket {
             protocols,
@@ -2252,7 +2358,7 @@ async fn http_network_fetch(
                     .map_err(|_| unreachable!())
                     .boxed(),
             });
-            (Decoder::detect(response, url.is_secure_scheme()), None)
+            (Decoder::detect(response, url.is_secure_scheme()), None, None)
         },
         // Let connection be the result of obtaining a connection, given networkPartitionKey,
         // request’s current URL, includeCredentials, and newConnection.
@@ -2268,11 +2374,11 @@ async fn http_network_fetch(
             );
 
             // This will only get the headers, the body is read later
-            let (response_stream, msg) = match response_future.await {
+            let (response_stream, msg, permit) = match response_future.await {
                 Ok(wrapped_response) => wrapped_response,
                 Err(error) => return Response::network_error(error),
             };
-            (response_stream, msg)
+            (response_stream, msg, Some(permit))
         },
     };
 
@@ -2336,6 +2442,7 @@ async fn http_network_fetch(
     response.referrer_policy = request.referrer_policy;
 
     let response_body = response.body.clone();
+    let response_aborted = response.aborted.clone();
 
     // We're about to spawn a future to be waited on here
     let (done_sender, done_receiver) = unbounded_channel();
@@ -2361,12 +2468,8 @@ async fn http_network_fetch(
         )
     };
 
-    let done_sender2 = done_sender.clone();
-    let done_sender3 = done_sender.clone();
-    let timing_ptr2 = fetch_params.timing_info.clone();
-    let timing_ptr3 = fetch_params.timing_info.clone();
+    let timing_ptr = fetch_params.timing_info.clone();
     let url1 = request.url();
-    let url2 = url1.clone();
 
     let prealloc_size: usize = if let Some(possible_length) = response_stream
         .headers()
@@ -2390,73 +2493,87 @@ async fn http_network_fetch(
     .min(pref!(network_max_content_length) as usize);
     let _ = done_sender.send(Data::ContentLength(prealloc_size));
     *response_body.lock() = ResponseBody::Receiving(Vec::with_capacity(prealloc_size));
-    let response_body2 = response_body.clone();
 
-    spawn_task(
-        response_stream
-            .into_body()
-            .try_fold(response_body, move |response_body_accumulator, chunk| {
-                if cancellation_listener.cancelled() {
-                    *response_body_accumulator.lock() = ResponseBody::Done(vec![]);
-                    let _ = done_sender.send(Data::Cancelled);
-                    return future::ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "Fetch aborted",
-                    )));
-                }
-                if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
-                    body.extend_from_slice(&chunk);
-                    let _ = done_sender.send(Data::Payload(chunk));
-                }
-                future::ready(Ok(response_body_accumulator))
-            })
-            .and_then(move |complete_response_body| {
-                debug!("successfully finished response for {:?}", url1);
-                let mut body = complete_response_body.lock();
-                let mut completed_body = match *body {
-                    ResponseBody::Receiving(ref mut body) => std::mem::take(body),
-                    _ => vec![],
-                };
-                // This allocation may be retained by the http-cache.
-                completed_body.shrink_to_fit();
-                // If devtools is disabled avoid cloning, since the result would
-                // be unused anyway.
-                #[cfg(feature = "devtools")]
-                let devtools_response_body =
-                    devtools_chan.is_some().then(|| completed_body.clone());
-                *body = ResponseBody::Done(completed_body);
-                #[cfg(feature = "devtools")]
-                send_response_values_to_devtools(
-                    Some(headers),
-                    status,
-                    devtools_response_body,
-                    CacheState::None,
-                    &devtools_request,
-                    devtools_chan,
-                );
-                timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender2.send(Data::Done);
-                future::ready(Ok(()))
-            })
-            .map_err(move |error| {
-                if let std::io::ErrorKind::InvalidData = error.kind() {
-                    debug!("Content decompression error for {:?}", url2);
-                    let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));
-                    let mut body = response_body2.lock();
+    spawn_task(async move {
+        let _host_permit = host_permit;
+        let mut body_stream = response_stream.into_body();
+        loop {
+            if cancellation_listener.cancelled() {
+                response_aborted.store(true, Ordering::Release);
+                *response_body.lock() = ResponseBody::Done(vec![]);
+                timing_ptr.set_attribute(ResourceAttribute::ResponseEnd);
+                let _ = done_sender.send(Data::Cancelled);
+                return;
+            }
 
-                    *body = ResponseBody::Done(vec![]);
-                }
-                debug!("finished response for {:?}", url2);
-                let mut body = response_body2.lock();
-                let completed_body = match *body {
-                    ResponseBody::Receiving(ref mut body) => std::mem::take(body),
-                    _ => vec![],
-                };
-                *body = ResponseBody::Done(completed_body);
-                timing_ptr3.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender3.send(Data::Done);
-            }),
-    );
+            match tokio::time::timeout(Duration::from_secs(25), body_stream.try_next()).await {
+                Ok(Ok(Some(chunk))) => {
+                    if cancellation_listener.cancelled() {
+                        response_aborted.store(true, Ordering::Release);
+                        *response_body.lock() = ResponseBody::Done(vec![]);
+                        timing_ptr.set_attribute(ResourceAttribute::ResponseEnd);
+                        let _ = done_sender.send(Data::Cancelled);
+                        return;
+                    }
+                    if let ResponseBody::Receiving(ref mut body) = *response_body.lock() {
+                        body.extend_from_slice(&chunk);
+                        let _ = done_sender.send(Data::Payload(chunk));
+                    }
+                },
+                Ok(Ok(None)) => {
+                    debug!("successfully finished response for {:?}", url1);
+                    let mut body = response_body.lock();
+                    let mut completed_body = match *body {
+                        ResponseBody::Receiving(ref mut body) => std::mem::take(body),
+                        _ => vec![],
+                    };
+                    // This allocation may be retained by the http-cache.
+                    completed_body.shrink_to_fit();
+                    // If devtools is disabled avoid cloning, since the result would
+                    // be unused anyway.
+                    #[cfg(feature = "devtools")]
+                    let devtools_response_body =
+                        devtools_chan.is_some().then(|| completed_body.clone());
+                    *body = ResponseBody::Done(completed_body);
+                    #[cfg(feature = "devtools")]
+                    send_response_values_to_devtools(
+                        Some(headers),
+                        status,
+                        devtools_response_body,
+                        CacheState::None,
+                        &devtools_request,
+                        devtools_chan,
+                    );
+                    timing_ptr.set_attribute(ResourceAttribute::ResponseEnd);
+                    let _ = done_sender.send(Data::Done);
+                    return;
+                },
+                Ok(Err(error)) => {
+                    if let std::io::ErrorKind::InvalidData = error.kind() {
+                        debug!("Content decompression error for {:?}", url1);
+                        let _ = done_sender.send(Data::Error(NetworkError::DecompressionError));
+                    } else {
+                        warn!("Response body stream error for {:?}: {:?}", url1, error);
+                        let _ = done_sender.send(Data::Error(NetworkError::ConnectionFailure));
+                    }
+                    response_aborted.store(true, Ordering::Release);
+                    *response_body.lock() = ResponseBody::Done(vec![]);
+                    timing_ptr.set_attribute(ResourceAttribute::ResponseEnd);
+                    let _ = done_sender.send(Data::Done);
+                    return;
+                },
+                Err(_elapsed) => {
+                    warn!("response body read timed out for {:?}", url1);
+                    response_aborted.store(true, Ordering::Release);
+                    *response_body.lock() = ResponseBody::Done(vec![]);
+                    let _ = done_sender.send(Data::Error(NetworkError::ConnectionFailure));
+                    timing_ptr.set_attribute(ResourceAttribute::ResponseEnd);
+                    let _ = done_sender.send(Data::Done);
+                    return;
+                },
+            }
+        }
+    });
 
     // TODO these substeps aren't possible yet
     // Substep 1

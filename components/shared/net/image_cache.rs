@@ -207,6 +207,13 @@ pub trait ImageCacheFactory: Sync + Send {
     ) -> Arc<dyn ImageCache>;
 }
 
+/// Mode used when converting a source image into a single-channel WebRender `R8` mask texture.
+#[derive(Clone, Copy, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
+pub enum MaskImageMode {
+    Alpha,
+    Luminance,
+}
+
 /// An [`ImageCache`] manages fetching and decoding images for a single `Pipeline` for its
 /// `Document` and all of its associated `Worker`s.
 pub trait ImageCache: Sync + Send {
@@ -263,6 +270,47 @@ pub trait ImageCache: Sync + Send {
 
     /// Removes the rasterized image from the image_cache, identified by the id of the SVG
     fn evict_rasterized_image(&self, svg_id: &Uuid);
+
+    /// Returns the most recently completed rasterized image for an inline `<svg>` element
+    /// so animated SVGs keep displaying their previous frame while a newer frame decodes/rasterizes.
+    fn get_last_rasterized_svg_image(
+        &self,
+        svg_id: &Uuid,
+        requested_size: DeviceIntSize,
+    ) -> Option<RasterImage> {
+        let _ = (svg_id, requested_size);
+        None
+    }
+
+    /// Returns a cached single-channel `R8` WebRender [`ImageKey`] derived from `source_image`
+    /// using the requested CSS `mask-mode`, uploading it to WebRender on first use.
+    fn get_or_create_mask_image_key(
+        &self,
+        source_image: &RasterImage,
+        mode: MaskImageMode,
+    ) -> Option<ImageKey> {
+        let _ = (source_image, mode);
+        None
+    }
+
+    /// Returns a cached synthetic single-channel `R8` WebRender [`ImageKey`] for `cache_key`,
+    /// updating its LRU ordering if present.
+    fn get_r8_mask_image_key(&self, cache_key: u64) -> Option<ImageKey> {
+        let _ = cache_key;
+        None
+    }
+
+    /// Returns a cached synthetic single-channel `R8` WebRender [`ImageKey`] for `cache_key`,
+    /// or uploads `data` as an `R8` texture of `size` to WebRender and caches it under `cache_key`.
+    fn get_or_create_r8_mask_image_key(
+        &self,
+        cache_key: u64,
+        size: DeviceIntSize,
+        data: &[u8],
+    ) -> Option<ImageKey> {
+        let _ = (cache_key, size, data);
+        None
+    }
 
     /// Removes the completed image from the image_cache, identified by url, origin, and cors
     fn evict_completed_image(

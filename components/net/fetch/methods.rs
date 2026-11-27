@@ -853,6 +853,11 @@ pub async fn main_fetch(
         if !response_loaded {
             wait_for_response(request, &mut response, target, done_chan, context).await;
         }
+        if response.get_resource_timing().inner().response_end.is_none() {
+            response
+                .get_resource_timing()
+                .set_attribute(ResourceAttribute::ResponseEnd);
+        }
         // overloaded similarly to process_response
         target.process_response_eof(request, &response);
         return response;
@@ -870,12 +875,20 @@ pub async fn main_fetch(
     // Step 22.
     target.process_response(request, &response);
     // Send Response to Devtools
-    send_response_to_devtools(request, context, &response, None);
-    send_security_info_to_devtools(request, context, &response);
+    if !response.is_network_error() {
+        send_response_to_devtools(request, context, &response, None);
+        send_security_info_to_devtools(request, context, &response);
+    }
 
     // Step 23.
     if !response_loaded {
         wait_for_response(request, &mut response, target, done_chan, context).await;
+    }
+
+    if response.get_resource_timing().inner().response_end.is_none() {
+        response
+            .get_resource_timing()
+            .set_attribute(ResourceAttribute::ResponseEnd);
     }
 
     // Step 24.
@@ -883,7 +896,9 @@ pub async fn main_fetch(
     // Send Response to Devtools
     // This is done after process_response_eof to ensure that the body is fully
     // processed before sending the response to Devtools.
-    send_response_to_devtools(request, context, &response, None);
+    if !response.is_network_error() {
+        send_response_to_devtools(request, context, &response, None);
+    }
 
     context
         .state

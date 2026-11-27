@@ -121,6 +121,7 @@ use crate::dom::globalscope::listeners::{
     MessageListener, MessagePortState,
 };
 use crate::dom::idbfactory::IDBFactory;
+use crate::dom::mediasource::MediaSource;
 use crate::dom::messageport::MessagePort;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::performance::performance::Performance;
@@ -183,6 +184,9 @@ pub(crate) struct GlobalScope {
 
     /// The blobs managed by this global, if any.
     blob_state: DomRefCell<HashMapTracedValues<BlobId, BlobInfo, FxBuildHasher>>,
+
+    /// MediaSource objects registered via `URL.createObjectURL(mediaSource)`.
+    media_source_urls: DomRefCell<HashMapTracedValues<String, Dom<MediaSource>, FxBuildHasher>>,
 
     /// <https://w3c.github.io/ServiceWorker/#environment-settings-object-service-worker-registration-object-map>
     registration_map: DomRefCell<
@@ -344,6 +348,7 @@ impl GlobalScope {
     pub(crate) fn tear_down(&self) {
         self.fetch_group_mut().terminate(self);
         self.close_event_sources();
+        self.clean_up_media_sources();
         self.with_module_map(|module_map| std::mem::take(&mut *module_map.borrow_mut()));
     }
 
@@ -411,6 +416,7 @@ impl GlobalScope {
             broadcast_channel_state: DomRefCell::new(BroadcastChannelState::UnManaged),
             constellation_interest_counts: Default::default(),
             blob_state: Default::default(),
+            media_source_urls: DomRefCell::new(HashMapTracedValues::new_fx()),
             eventtarget: EventTarget::new_inherited(),
             registration_map: DomRefCell::new(HashMapTracedValues::new_fx()),
             indexeddb: Default::default(),
@@ -1543,6 +1549,28 @@ impl GlobalScope {
                     self.decrement_file_ref(f.get_id());
                 }
             });
+        self.clean_up_media_sources();
+    }
+
+    pub(crate) fn register_media_source_url(&self, url: String, media_source: &MediaSource) {
+        self.media_source_urls
+            .borrow_mut()
+            .insert(url, Dom::from_ref(media_source));
+    }
+
+    pub(crate) fn revoke_media_source_url(&self, url: &str) -> bool {
+        self.media_source_urls.borrow_mut().remove(url).is_some()
+    }
+
+    pub(crate) fn lookup_media_source_url(&self, url: &str) -> Option<DomRoot<MediaSource>> {
+        self.media_source_urls
+            .borrow()
+            .get(url)
+            .map(|ms| DomRoot::from_ref(&**ms))
+    }
+
+    pub(crate) fn clean_up_media_sources(&self) {
+        self.media_source_urls.borrow_mut().0.clear();
     }
 
     fn decrement_file_ref(&self, id: Uuid) {

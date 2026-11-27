@@ -90,6 +90,23 @@ impl AnimationEffect {
         &self.window
     }
 
+    pub(crate) fn total_end_time_ms(&self) -> f64 {
+        let timing = self.specified_timing_properties.borrow();
+        let iter_dur = timing.iteration_duration.computed_value();
+        let active_dur = if timing.iteration_count == 0.0 || iter_dur == 0.0 {
+            0.0
+        } else if timing.iteration_count.is_infinite() {
+            f64::INFINITY
+        } else {
+            iter_dur * timing.iteration_count
+        };
+        if active_dur.is_infinite() {
+            f64::INFINITY
+        } else {
+            (*timing.start_delay + active_dur + *timing.end_delay).max(0.0)
+        }
+    }
+
     /// <https://drafts.csswg.org/web-animations-1/#update-the-timing-properties-of-an-animation-effect>
     pub(crate) fn update_the_timing_properties(
         &self,

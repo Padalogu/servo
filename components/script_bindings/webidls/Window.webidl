@@ -182,3 +182,15 @@ dictionary DeferredRequestInit : RequestInit {
 partial interface Window {
   [NewObject, SecureContext, Throws] FetchLaterResult fetchLater(RequestInfo input, optional DeferredRequestInit init = {});
 };
+
+// https://w3c.github.io/requestidlecallback/
+dictionary IdleRequestOptions {
+  unsigned long timeout;
+};
+
+callback IdleRequestCallback = undefined (IdleDeadline deadline);
+
+partial interface Window {
+  unsigned long requestIdleCallback(IdleRequestCallback callback, optional IdleRequestOptions options = {});
+  undefined cancelIdleCallback(unsigned long handle);
+};

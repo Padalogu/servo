@@ -119,6 +119,9 @@ mod enabled {
         response: &Response,
         body_data: Option<Vec<u8>>,
     ) {
+        if context.devtools_chan.is_none() {
+            return;
+        }
         let Ok(metadata): Result<Metadata, _> = response.metadata().map(Into::into) else {
             log::warn!("No metadata available, skipping devtools response.");
             return;
@@ -171,6 +174,9 @@ mod enabled {
         context: &FetchContext,
         response: &Response,
     ) {
+        if context.devtools_chan.is_none() {
+            return;
+        }
         let Ok(metadata): Result<Metadata, _> = response.metadata().map(Into::into) else {
             log::warn!("No metadata available, skipping devtools security info.");
             return;

@@ -646,15 +646,20 @@ pub fn generic_transform_inplace<
         match MULTIPLY {
             1 => {
                 let a = rgba[3];
-
-                rgba[0] = multiply_u8_color(rgba[0], a);
-                rgba[1] = multiply_u8_color(rgba[1], a);
-                rgba[2] = multiply_u8_color(rgba[2], a);
+                if a == 0 {
+                    rgba[0] = 0;
+                    rgba[1] = 0;
+                    rgba[2] = 0;
+                } else if a != u8::MAX {
+                    rgba[0] = multiply_u8_color(rgba[0], a);
+                    rgba[1] = multiply_u8_color(rgba[1], a);
+                    rgba[2] = multiply_u8_color(rgba[2], a);
+                }
             },
             2 => {
                 let a = rgba[3] as u32;
 
-                if a > 0 {
+                if a > 0 && a < u8::MAX as u32 {
                     rgba[0] = (rgba[0] as u32 * 255 / a) as u8;
                     rgba[1] = (rgba[1] as u32 * 255 / a) as u8;
                     rgba[2] = (rgba[2] as u32 * 255 / a) as u8;

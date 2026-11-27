@@ -205,7 +205,7 @@
 #[macro_use]
 pub(crate) mod macros;
 
-#[expect(unused)]
+#[allow(unused)]
 pub(crate) mod types {
     include!(concat!(env!("OUT_DIR"), "/InterfaceTypes.rs"));
 }
@@ -250,6 +250,8 @@ pub(crate) use self::document::*;
 pub(crate) mod domexception;
 pub(crate) mod element;
 pub(crate) use self::element::*;
+pub(crate) mod eme;
+pub(crate) use self::eme::*;
 pub(crate) mod encoding;
 pub(crate) use self::encoding::*;
 pub(crate) mod event;
@@ -285,6 +287,8 @@ pub(crate) mod mathml;
 pub(crate) use self::mathml::*;
 pub(crate) mod media;
 pub(crate) use self::media::*;
+pub(crate) mod mediasource;
+pub(crate) use self::mediasource::*;
 pub(crate) mod mimetype;
 pub(crate) use self::mimetype::*;
 pub(crate) mod mutationobserver;

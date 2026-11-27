@@ -13,8 +13,8 @@ use layout_api::{
     PendingImageState, PendingRasterizationImage,
 };
 use net_traits::image_cache::{
-    Image as CachedImage, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, PendingImageId,
-    RasterizationResult,
+    Image as CachedImage, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, MaskImageMode,
+    PendingImageId, RasterizationResult,
 };
 use net_traits::request::InternalRequest;
 use parking_lot::{Mutex, RwLock};
@@ -295,10 +295,60 @@ impl ImageResolver {
         }
     }
 
+    /// Resolve a cached image to a single-channel `R8` WebRender [`ImageKey`] suitable for CSS `mask-image`.
+    pub(crate) fn mask_image_key_from_cached_image(
+        &self,
+        image: &CachedImage,
+        size: DeviceIntSize,
+        node: Option<OpaqueNode>,
+        mode: MaskImageMode,
+    ) -> Option<ImageKey> {
+        match image {
+            CachedImage::Raster(raster_image) => self
+                .image_cache
+                .get_or_create_mask_image_key(raster_image, mode),
+            CachedImage::Vector(vector_image) => node.and_then(|node| {
+                let rasterized_image = self.rasterize_vector_image(
+                    vector_image.id,
+                    size,
+                    node,
+                    vector_image.svg_id,
+                )?;
+                self.image_cache
+                    .get_or_create_mask_image_key(&rasterized_image, mode)
+            }),
+        }
+    }
+
+    /// Look up a cached synthetic single-channel `R8` WebRender [`ImageKey`] by `cache_key`.
+    pub(crate) fn get_r8_mask_image_key(&self, cache_key: u64) -> Option<ImageKey> {
+        self.image_cache.get_r8_mask_image_key(cache_key)
+    }
+
+    /// Look up or upload a synthetic single-channel `R8` WebRender [`ImageKey`] for `cache_key`.
+    pub(crate) fn get_or_create_r8_mask_image_key(
+        &self,
+        cache_key: u64,
+        size: DeviceIntSize,
+        data: &[u8],
+    ) -> Option<ImageKey> {
+        self.image_cache
+            .get_or_create_r8_mask_image_key(cache_key, size, data)
+    }
+
     pub(crate) fn queue_svg_element_for_serialization(&self, element: ServoLayoutNode<'_>) {
         self.pending_svg_elements_for_serialization
             .lock()
             .push(element.opaque().into())
+    }
+
+    pub(crate) fn get_last_rasterized_svg_image(
+        &self,
+        svg_id: &Uuid,
+        size: DeviceIntSize,
+    ) -> Option<RasterImage> {
+        self.image_cache
+            .get_last_rasterized_svg_image(svg_id, size)
     }
 
     pub(crate) fn resolve_image<'a>(

@@ -67,11 +67,32 @@ pub static enclosing_size: Option<EnclosingSizeFn> = None;
 mod platform {
     use std::ffi::CStr;
     use std::mem::size_of_val;
-    use std::os::raw::c_void;
+    use std::os::raw::{c_char, c_void};
     use std::ptr;
 
     use tikv_jemalloc_sys::mallctl;
     pub use tikv_jemallocator::Jemalloc as Allocator;
+
+    #[cfg(target_os = "linux")]
+    #[used]
+    #[allow(non_upper_case_globals)]
+    #[unsafe(export_name = "_rjem_malloc_conf")]
+    pub static malloc_conf: Option<&'static c_char> =
+        Some(unsafe { &*c"dirty_decay_ms:5000,muzzy_decay_ms:5000".as_ptr() });
+
+    /// Purge unused dirty and muzzy pages across all jemalloc arenas.
+    pub fn purge_unused_memory() {
+        // 4096 is jemalloc's `MALLCTL_ARENAS_ALL` constant (all arenas).
+        let _ = unsafe {
+            mallctl(
+                c"arena.4096.purge".as_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+    }
 
     pub fn heap_reports() -> Vec<crate::HeapReport> {
         vec![
@@ -187,6 +208,14 @@ mod platform {
     pub fn heap_reports() -> Vec<crate::HeapReport> {
         Vec::new()
     }
+
+    /// Purge unused heap memory back to the OS.
+    pub fn purge_unused_memory() {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            let _ = libc::malloc_trim(0);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -220,4 +249,7 @@ mod platform {
     pub fn heap_reports() -> Vec<crate::HeapReport> {
         Vec::new()
     }
+
+    /// Purge unused heap memory back to the OS.
+    pub fn purge_unused_memory() {}
 }

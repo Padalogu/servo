@@ -9,12 +9,15 @@ use std::ops::{Add, AddAssign};
 use std::sync::atomic::Ordering;
 
 use app_units::{Au, MAX_AU};
+use layout_api::AxesOverflow;
 use malloc_size_of_derive::MallocSizeOf;
 use style::Zero;
 use style::logical_geometry::LogicalAxis;
+use style::properties::ComputedValues;
 use style::values::computed::{
     LengthPercentage, MaxSize as StyleMaxSize, Percentage, Size as StyleSize,
 };
+use style::values::specified::Overflow;
 
 use crate::context::LayoutContext;
 use crate::layout_box_base::LayoutBoxBase;
@@ -788,6 +791,90 @@ impl Sizes {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NonReplacedAspectRatioBlockSize {
+    pub ratio_block_size: Au,
+    pub clamped_ratio_block_size: Au,
+    pub auto_min_content_floor: bool,
+}
+
+impl NonReplacedAspectRatioBlockSize {
+    pub(crate) fn from_style(
+        style: &ComputedValues,
+        preferred_aspect_ratio: Option<AspectRatio>,
+        block_sizes: &Sizes,
+        block_stretch_size: Option<Au>,
+        tentative_block_size: SizeConstraint,
+        inline_size: Au,
+    ) -> Option<Self> {
+        let overflow = AxesOverflow::from(style);
+        let block_overflow_is_visible = if style.writing_mode.is_horizontal() {
+            overflow.y == Overflow::Visible
+        } else {
+            overflow.x == Overflow::Visible
+        };
+        Self::compute(
+            block_overflow_is_visible,
+            preferred_aspect_ratio,
+            block_sizes,
+            block_stretch_size,
+            tentative_block_size,
+            inline_size,
+        )
+    }
+
+    pub(crate) fn compute(
+        block_overflow_is_visible: bool,
+        preferred_aspect_ratio: Option<AspectRatio>,
+        block_sizes: &Sizes,
+        block_stretch_size: Option<Au>,
+        tentative_block_size: SizeConstraint,
+        inline_size: Au,
+    ) -> Option<Self> {
+        let ratio = preferred_aspect_ratio?;
+        if !block_sizes.preferred.is_initial() || tentative_block_size.is_definite() {
+            return None;
+        }
+        let ratio_block_size = ratio
+            .compute_dependent_size(LogicalAxis::Block, inline_size)
+            .max(Au::zero());
+        let clamped_ratio_block_size = block_sizes.resolve(
+            LogicalAxis::Block,
+            Size::Numeric(ratio_block_size),
+            Au::zero,
+            block_stretch_size,
+            ContentSizes::zero,
+            false,
+        );
+        let auto_min_content_floor = block_sizes.min.is_initial() && block_overflow_is_visible;
+        Some(Self {
+            ratio_block_size,
+            clamped_ratio_block_size,
+            auto_min_content_floor,
+        })
+    }
+
+    pub(crate) fn resolve_with_content_size(
+        self,
+        block_sizes: &Sizes,
+        block_stretch_size: Option<Au>,
+        content_block_size: Au,
+    ) -> Au {
+        if self.auto_min_content_floor {
+            block_sizes.resolve(
+                LogicalAxis::Block,
+                Size::Numeric(self.ratio_block_size.max(content_block_size)),
+                Au::zero,
+                block_stretch_size,
+                || content_block_size.into(),
+                false,
+            )
+        } else {
+            self.clamped_ratio_block_size
+        }
+    }
+}
+
 struct LazySizeData<'a> {
     sizes: &'a Sizes,
     axis: LogicalAxis,
@@ -795,6 +882,7 @@ struct LazySizeData<'a> {
     get_automatic_minimum_size: fn() -> Au,
     stretch_size: Option<Au>,
     is_table: bool,
+    aspect_ratio: Option<NonReplacedAspectRatioBlockSize>,
 }
 
 /// Represents a size that can't be fully resolved until the intrinsic size
@@ -823,7 +911,14 @@ impl<'a> LazySize<'a> {
                 get_automatic_minimum_size,
                 stretch_size,
                 is_table,
+                aspect_ratio: None,
             }),
+        }
+    }
+
+    pub(crate) fn set_aspect_ratio(&mut self, aspect_ratio: NonReplacedAspectRatioBlockSize) {
+        if let Some(ref mut data) = self.data {
+            data.aspect_ratio = Some(aspect_ratio);
         }
     }
 
@@ -850,6 +945,13 @@ impl<'a> LazySize<'a> {
             let Some(ref data) = self.data else {
                 return get_content_size();
             };
+            if let Some(aspect_ratio) = data.aspect_ratio {
+                return aspect_ratio.resolve_with_content_size(
+                    data.sizes,
+                    data.stretch_size,
+                    get_content_size(),
+                );
+            }
             data.sizes.resolve(
                 data.axis,
                 data.automatic_size,
@@ -869,5 +971,81 @@ impl From<Au> for LazySize<'_> {
         let result = OnceCell::new();
         result.set(value).unwrap();
         LazySize { result, data: None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_replaced_aspect_ratio_block_size_cases() {
+        let ratio = Some(AspectRatio::from_logical_content_ratio(0.5)); // 1 / 2
+        let inline_size = Au::from_px(150);
+
+        // 1. width: 150px, aspect-ratio: 1/2, height: auto, empty/abspos content => 300px
+        let sizes = Sizes::default();
+        let ar = NonReplacedAspectRatioBlockSize::compute(
+            true,
+            ratio,
+            &sizes,
+            None,
+            SizeConstraint::default(),
+            inline_size,
+        )
+        .expect("should resolve aspect-ratio");
+        assert_eq!(ar.clamped_ratio_block_size, Au::from_px(300));
+        assert_eq!(ar.resolve_with_content_size(&sizes, None, Au::zero()), Au::from_px(300));
+
+        // 2. overflow: visible with taller content (400px) => expands to 400px
+        assert_eq!(
+            ar.resolve_with_content_size(&sizes, None, Au::from_px(400)),
+            Au::from_px(400)
+        );
+
+        // 3. overflow: hidden with taller content (400px) => stays at 300px
+        let ar_clipped = NonReplacedAspectRatioBlockSize::compute(
+            false,
+            ratio,
+            &sizes,
+            None,
+            SizeConstraint::default(),
+            inline_size,
+        )
+        .expect("should resolve aspect-ratio when overflow is clipped");
+        assert_eq!(
+            ar_clipped.resolve_with_content_size(&sizes, None, Au::from_px(400)),
+            Au::from_px(300)
+        );
+
+        // 4. max-height: 200px clamps ratio size and content size
+        let max_sizes = Sizes::new(Size::Initial, Size::Initial, Size::Numeric(Au::from_px(200)));
+        let ar_max = NonReplacedAspectRatioBlockSize::compute(
+            true,
+            ratio,
+            &max_sizes,
+            None,
+            SizeConstraint::default(),
+            inline_size,
+        )
+        .expect("should resolve aspect-ratio with max-height");
+        assert_eq!(ar_max.clamped_ratio_block_size, Au::from_px(200));
+        assert_eq!(
+            ar_max.resolve_with_content_size(&max_sizes, None, Au::from_px(400)),
+            Au::from_px(200)
+        );
+
+        // 5. Definite tentative_block_size (e.g. top: 0; bottom: 0 stretch) ignores aspect-ratio
+        assert!(
+            NonReplacedAspectRatioBlockSize::compute(
+                true,
+                ratio,
+                &sizes,
+                Some(Au::from_px(500)),
+                SizeConstraint::Definite(Au::from_px(500)),
+                inline_size,
+            )
+            .is_none()
+        );
     }
 }

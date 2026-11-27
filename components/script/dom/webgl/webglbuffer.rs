@@ -105,7 +105,11 @@ impl DroppableWebGLBuffer {
 
 impl Drop for DroppableWebGLBuffer {
     fn drop(&mut self) {
-        self.mark_for_deletion(Operation::Fallible);
+        if !self.is_deleted() {
+            self.set_attached_counter(0);
+            self.set_marked_for_deletion(true);
+            self.delete(Operation::Fallible);
+        }
     }
 }
 
@@ -266,11 +270,10 @@ impl WebGLBuffer {
     }
 
     pub(crate) fn decrement_attached_counter(&self, operation_fallibility: Operation) {
-        self.set_attached_counter(
-            self.get_attached_counter()
-                .checked_sub(1)
-                .expect("refcount underflowed"),
-        );
+        let Some(next) = self.get_attached_counter().checked_sub(1) else {
+            return;
+        };
+        self.set_attached_counter(next);
         if self.is_deleted() {
             self.delete(operation_fallibility);
         }

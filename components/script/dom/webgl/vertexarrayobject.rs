@@ -262,8 +262,17 @@ impl VertexArrayObject {
 
 impl Drop for VertexArrayObject {
     fn drop(&mut self) {
-        if self.id.is_some() {
-            self.delete(Operation::Fallible);
+        if let Some(id) = self.id {
+            if self.is_deleted.get() {
+                return;
+            }
+            self.is_deleted.set(true);
+            if let Some(context) = self.context.root() {
+                context.send_with_fallibility(
+                    WebGLCommand::DeleteVertexArray(id),
+                    Operation::Fallible,
+                );
+            }
         }
     }
 }

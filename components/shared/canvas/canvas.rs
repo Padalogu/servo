@@ -10,7 +10,10 @@ use euclid::Angle;
 use euclid::approxeq::ApproxEq;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use fonts_traits::{FontDataAndIndex, FontIdentifier};
-use kurbo::{BezPath, ParamCurveNearest as _, PathEl, Point, Shape, Triangle};
+use kurbo::{
+    BezPath, Circle, Ellipse, ParamCurve as _, ParamCurveArclen as _, ParamCurveNearest as _,
+    PathEl, Point, Rect as KurboRect, RoundedRect, RoundedRectRadii, Shape, Triangle,
+};
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
 use pixels::SharedSnapshot;
@@ -52,6 +55,113 @@ impl Path {
 
     pub fn from_svg(s: &str) -> Self {
         Self(BezPath::from_svg(s).unwrap_or_default())
+    }
+
+    pub fn from_svg_circle(cx: f64, cy: f64, r: f64) -> Self {
+        if r.is_finite() && r > 0.0 && cx.is_finite() && cy.is_finite() {
+            Self(Circle::new((cx, cy), r).to_path(0.1))
+        } else {
+            Self::new()
+        }
+    }
+
+    pub fn from_svg_ellipse(cx: f64, cy: f64, rx: f64, ry: f64) -> Self {
+        if rx.is_finite()
+            && ry.is_finite()
+            && rx > 0.0
+            && ry > 0.0
+            && cx.is_finite()
+            && cy.is_finite()
+        {
+            Self(Ellipse::new((cx, cy), (rx, ry), 0.0).to_path(0.1))
+        } else {
+            Self::new()
+        }
+    }
+
+    pub fn from_svg_rect(x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64) -> Self {
+        if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite())
+            || w <= 0.0
+            || h <= 0.0
+        {
+            return Self::new();
+        }
+        let rx = if rx.is_finite() && rx > 0.0 {
+            rx.min(w * 0.5)
+        } else {
+            0.0
+        };
+        let ry = if ry.is_finite() && ry > 0.0 {
+            ry.min(h * 0.5)
+        } else {
+            0.0
+        };
+        if rx <= 0.0 && ry <= 0.0 {
+            return Self(KurboRect::new(x, y, x + w, y + h).to_path(0.1));
+        }
+        if (rx - ry).abs() <= 1e-6 {
+            return Self(
+                RoundedRect::new(x, y, x + w, y + h, RoundedRectRadii::from_single_radius(rx))
+                    .to_path(0.1),
+            );
+        }
+        const KAPPA: f64 = 0.5522847498307936;
+        let kx = rx * KAPPA;
+        let ky = ry * KAPPA;
+        let mut p = BezPath::new();
+        p.move_to((x + rx, y));
+        p.line_to((x + w - rx, y));
+        p.curve_to((x + w - rx + kx, y), (x + w, y + ry - ky), (x + w, y + ry));
+        p.line_to((x + w, y + h - ry));
+        p.curve_to(
+            (x + w, y + h - ry + ky),
+            (x + w - rx + kx, y + h),
+            (x + w - rx, y + h),
+        );
+        p.line_to((x + rx, y + h));
+        p.curve_to((x + rx - kx, y + h), (x, y + h - ry + ky), (x, y + h - ry));
+        p.line_to((x, y + ry));
+        p.curve_to((x, y + ry - ky), (x + rx - kx, y), (x + rx, y));
+        p.close_path();
+        Self(p)
+    }
+
+    pub fn total_length(&self) -> f64 {
+        self.0.segments().map(|seg| seg.arclen(1e-3)).sum()
+    }
+
+    pub fn point_at_length(&self, distance: f64) -> (f64, f64) {
+        let mut segments = self.0.segments();
+        let Some(first_seg) = segments.next() else {
+            for el in self.0.elements() {
+                if let PathEl::MoveTo(pt) = el {
+                    return (pt.x, pt.y);
+                }
+            }
+            return (0.0, 0.0);
+        };
+        if !distance.is_finite() || distance <= 0.0 {
+            let start = first_seg.start();
+            return (start.x, start.y);
+        }
+        let mut acc = 0.0;
+        let mut last_seg = first_seg;
+        for seg in std::iter::once(first_seg).chain(segments) {
+            last_seg = seg;
+            let seg_len = seg.arclen(1e-3);
+            if acc + seg_len >= distance {
+                let t = if seg_len > 0.0 {
+                    seg.inv_arclen((distance - acc).clamp(0.0, seg_len), 1e-3)
+                } else {
+                    0.0
+                };
+                let pt = seg.eval(t);
+                return (pt.x, pt.y);
+            }
+            acc += seg_len;
+        }
+        let end = last_seg.end();
+        (end.x, end.y)
     }
 
     pub fn transform(&mut self, transform: Transform2D<f64>) {

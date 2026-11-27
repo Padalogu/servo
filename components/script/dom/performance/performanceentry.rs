@@ -28,7 +28,12 @@ use crate::dom::performance::performanceresourcetiming::PerformanceResourceTimin
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq, VariantArray)]
 pub(crate) enum EntryType {
     ContainerTiming,
+    Element,
+    Event,
+    FirstInput,
     LargestContentfulPaint,
+    LayoutShift,
+    LongTask,
     Mark,
     Measure,
     Navigation,
@@ -41,11 +46,16 @@ impl EntryType {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             EntryType::ContainerTiming => "container",
-            EntryType::Measure => "measure",
-            EntryType::Mark => "mark",
+            EntryType::Element => "element",
+            EntryType::Event => "event",
+            EntryType::FirstInput => "first-input",
             EntryType::LargestContentfulPaint => "largest-contentful-paint",
-            EntryType::Paint => "paint",
+            EntryType::LayoutShift => "layout-shift",
+            EntryType::LongTask => "longtask",
+            EntryType::Mark => "mark",
+            EntryType::Measure => "measure",
             EntryType::Navigation => "navigation",
+            EntryType::Paint => "paint",
             EntryType::Resource => "resource",
             EntryType::VisibilityState => "visibility-state",
         }
@@ -58,11 +68,16 @@ impl<'a> TryFrom<&'a str> for EntryType {
     fn try_from(value: &'a str) -> Result<EntryType, ()> {
         Ok(match value {
             "container" => EntryType::ContainerTiming,
-            "measure" => EntryType::Measure,
-            "mark" => EntryType::Mark,
+            "element" => EntryType::Element,
+            "event" => EntryType::Event,
+            "first-input" => EntryType::FirstInput,
             "largest-contentful-paint" => EntryType::LargestContentfulPaint,
-            "paint" => EntryType::Paint,
+            "layout-shift" => EntryType::LayoutShift,
+            "longtask" => EntryType::LongTask,
+            "mark" => EntryType::Mark,
+            "measure" => EntryType::Measure,
             "navigation" => EntryType::Navigation,
+            "paint" => EntryType::Paint,
             "resource" => EntryType::Resource,
             "visibility-state" => EntryType::VisibilityState,
             _ => return Err(()),

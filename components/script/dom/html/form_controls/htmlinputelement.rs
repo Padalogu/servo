@@ -1308,7 +1308,12 @@ impl HTMLInputElementMethods<crate::DomTypeHolder> for HTMLInputElement {
         }
 
         self.value_changed(cx);
-        self.upcast::<Node>().dirty(cx.no_gc(), NodeDamage::Other);
+        let damage = if self.is_textual_or_password() {
+            NodeDamage::ContentOrHeritage
+        } else {
+            NodeDamage::Other
+        };
+        self.upcast::<Node>().dirty(cx.no_gc(), damage);
         Ok(())
     }
 
@@ -1664,6 +1669,22 @@ impl HTMLInputElementMethods<crate::DomTypeHolder> for HTMLInputElement {
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage>
     fn ValidationMessage(&self, cx: &mut JSContext) -> DOMString {
         self.validation_message(cx)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-input-showpicker>
+    fn ShowPicker(&self, cx: &mut JSContext) -> ErrorResult {
+        if !self.is_mutable() || matches!(*self.input_type(), InputType::Hidden(_)) {
+            return Err(Error::InvalidState(Some(
+                "Input element is not mutable".into(),
+            )));
+        }
+        if !self.owner_window().has_transient_activation() {
+            return Err(Error::NotAllowed(Some(
+                "HTMLInputElement.showPicker() requires user activation".into(),
+            )));
+        }
+        self.show_the_picker_if_applicable(cx);
+        Ok(())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-setcustomvalidity>
@@ -2077,14 +2098,28 @@ impl HTMLInputElement {
             .convert_number_to_string(value)
     }
 
+    pub(crate) fn update_validity_state(&self, cx: &mut JSContext, update_flags: ValidationFlags) {
+        if let Some(validity_state) = self.validity_state.get() {
+            validity_state.perform_validation_and_update(cx, update_flags);
+        } else {
+            ValidityState::update_pseudo_classes_for_element(cx, self.upcast(), |cx| {
+                self.perform_validation(cx, ValidationFlags::all())
+                    .is_empty()
+            });
+        }
+    }
+
+    pub(crate) fn flush_shadow_tree(&self, cx: &mut JSContext) {
+        self.input_type().as_specific().update_shadow_tree(cx, self);
+    }
+
     fn update_related_validity_states(&self, cx: &mut JSContext) {
         match *self.input_type() {
             InputType::Radio(_) => {
                 perform_radio_group_validation(cx, self, self.radio_group_name().as_ref())
             },
             _ => {
-                self.validity_state(cx)
-                    .perform_validation_and_update(cx, ValidationFlags::all());
+                self.update_validity_state(cx, ValidationFlags::all());
             },
         }
     }
@@ -2093,7 +2128,18 @@ impl HTMLInputElement {
         self.maybe_update_shared_selection();
         self.update_related_validity_states(cx);
         if self.upcast::<Node>().is_connected() {
-            self.input_type().as_specific().update_shadow_tree(cx, self);
+            let defer_shadow_tree = self
+                .input_type()
+                .as_specific()
+                .text_input_widget()
+                .is_some_and(|widget| !widget.borrow().has_shadow_tree());
+            if defer_shadow_tree {
+                self.owner_document_unrooted(cx.no_gc())
+                    .schedule_input_shadow_tree_update(self);
+                self.upcast::<Node>().dirty(cx.no_gc(), NodeDamage::Other);
+            } else {
+                self.input_type().as_specific().update_shadow_tree(cx, self);
+            }
         }
     }
 
@@ -2429,7 +2475,31 @@ impl VirtualMethods for HTMLInputElement {
             },
         }
 
-        self.value_changed(cx);
+        let affects_value_or_validity = matches!(
+            *attr.local_name(),
+            local_name!("disabled") |
+                local_name!("checked") |
+                local_name!("size") |
+                local_name!("type") |
+                local_name!("value") |
+                local_name!("maxlength") |
+                local_name!("minlength") |
+                local_name!("placeholder") |
+                local_name!("readonly") |
+                local_name!("form") |
+                local_name!("required") |
+                local_name!("pattern") |
+                local_name!("min") |
+                local_name!("max") |
+                local_name!("step") |
+                local_name!("multiple") |
+                local_name!("name") |
+                local_name!("accept") |
+                local_name!("list")
+        );
+        if affects_value_or_validity {
+            self.value_changed(cx);
+        }
 
         if could_have_had_embedder_control && !self.may_have_embedder_control() {
             self.owner_document()
@@ -2481,9 +2551,9 @@ impl VirtualMethods for HTMLInputElement {
 
     fn unbind_from_tree(&self, cx: &mut JSContext, context: &UnbindContext) {
         // Always attempt to hide IME when unbinding input elements from the tree.
-        self.owner_document_unrooted(cx.no_gc())
-            .embedder_controls()
-            .hide_embedder_control(self.upcast());
+        let doc = self.owner_document_unrooted(cx.no_gc());
+        doc.unschedule_input_shadow_tree_update(self);
+        doc.embedder_controls().hide_embedder_control(self.upcast());
 
         let form_owner = self.form_owner();
         self.super_type().unwrap().unbind_from_tree(cx, context);
@@ -2492,8 +2562,7 @@ impl VirtualMethods for HTMLInputElement {
             .as_specific()
             .unbind_from_tree(cx, self, form_owner, context);
 
-        self.validity_state(cx)
-            .perform_validation_and_update(cx, ValidationFlags::all());
+        self.update_validity_state(cx, ValidationFlags::all());
     }
 
     // This represents behavior for which the UIEvents spec and the
@@ -2581,8 +2650,21 @@ impl Validatable for HTMLInputElement {
     }
 
     fn validity_state(&self, cx: &mut JSContext) -> DomRoot<ValidityState> {
-        self.validity_state
-            .or_init(|| ValidityState::new(cx, &self.owner_window(), self.upcast()))
+        self.validity_state.or_init(|| {
+            let state = ValidityState::new(cx, &self.owner_window(), self.upcast());
+            let flags = self.perform_validation(cx, ValidationFlags::all());
+            state.update_invalid_flags(flags);
+            state
+        })
+    }
+
+    fn satisfies_constraints(&self, cx: &mut JSContext) -> bool {
+        if let Some(validity_state) = self.validity_state.get() {
+            validity_state.invalid_flags().is_empty()
+        } else {
+            self.perform_validation(cx, ValidationFlags::all())
+                .is_empty()
+        }
     }
 
     fn is_instance_validatable(&self, no_gc: &NoGC) -> bool {

@@ -43,6 +43,7 @@ mod from_constellation {
                 Self::GenerateFrame { .. } => target!("GenerateFrame"),
                 Self::GenerateImageKey(..) => target!("GenerateImageKey"),
                 Self::UpdateImages(..) => target!("UpdateImages"),
+                Self::UpdateVideoImages(..) => target!("UpdateVideoImages"),
                 Self::GenerateFontKeys(..) => target!("GenerateFontKeys"),
                 Self::AddFont(..) => target!("AddFont"),
                 Self::AddSystemFont(..) => target!("AddSystemFont"),

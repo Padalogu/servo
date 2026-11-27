@@ -84,16 +84,24 @@ pub(super) fn build(
     }
 }
 
+pub(super) struct LinearGradientParams {
+    pub start_point: units::LayoutPoint,
+    pub end_point: units::LayoutPoint,
+    pub extend_mode: ExtendMode,
+    pub stops: Vec<wr::GradientStop>,
+}
+
+/// Compute the WebRender gradient line, extend mode, and stops for a CSS linear gradient.
+///
 /// <https://drafts.csswg.org/css-images-3/#linear-gradients>
-pub(super) fn build_linear(
+pub(super) fn resolve_linear_gradient(
     style: &ComputedValues,
     items: &[GradientItem<Color, LengthPercentage>],
     line_direction: &LineDirection,
     color_interpolation_method: &ColorInterpolationMethod,
     flags: GradientFlags,
     gradient_box: Size2D<f32, LayoutPixel>,
-    builder: &mut super::DisplayListBuilder,
-) -> WebRenderGradient {
+) -> LinearGradientParams {
     use style::values::specified::position::HorizontalPositionKeyword::*;
     use style::values::specified::position::VerticalPositionKeyword::*;
     use units::LayoutVector2D as Vec2;
@@ -181,11 +189,38 @@ pub(super) fn build_linear(
         gradient_items_to_color_stops(style, items, Au::from_f32_px(gradient_line_length));
     let stops = create_webrender_stops(&mut color_stops, color_interpolation_method, extend_mode);
 
-    WebRenderGradient::Linear(builder.wr().create_gradient(
+    LinearGradientParams {
         start_point,
         end_point,
-        stops,
         extend_mode,
+        stops,
+    }
+}
+
+/// <https://drafts.csswg.org/css-images-3/#linear-gradients>
+pub(super) fn build_linear(
+    style: &ComputedValues,
+    items: &[GradientItem<Color, LengthPercentage>],
+    line_direction: &LineDirection,
+    color_interpolation_method: &ColorInterpolationMethod,
+    flags: GradientFlags,
+    gradient_box: Size2D<f32, LayoutPixel>,
+    builder: &mut super::DisplayListBuilder,
+) -> WebRenderGradient {
+    let params = resolve_linear_gradient(
+        style,
+        items,
+        line_direction,
+        color_interpolation_method,
+        flags,
+        gradient_box,
+    );
+
+    WebRenderGradient::Linear(builder.wr().create_gradient(
+        params.start_point,
+        params.end_point,
+        params.stops,
+        params.extend_mode,
     ))
 }
 

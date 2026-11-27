@@ -177,5 +177,18 @@ partial interface Element {
   [CEReactions, Throws] undefined setHTML(DOMString html, optional SetHTMLOptions options = {});
 };
 
+// https://drafts.csswg.org/cssom-view/#dom-element-checkvisibility
+dictionary CheckVisibilityOptions {
+  boolean checkOpacity = false;
+  boolean checkVisibilityCSS = false;
+  boolean contentVisibilityAuto = false;
+  boolean opacityProperty = false;
+  boolean visibilityProperty = false;
+};
+
+partial interface Element {
+  boolean checkVisibility(optional CheckVisibilityOptions options = {});
+};
+
 // https://drafts.csswg.org/web-animations-1/#extensions-to-the-element-interface
 Element includes Animatable;

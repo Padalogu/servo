@@ -1557,10 +1557,10 @@ impl ParserContext {
             let page = match error {
                 NetworkError::SslValidation(reason, bytes) => {
                     let page = resources::read_string(Resource::BadCertHTML);
-                    let page = page.replace("${reason}", &reason);
                     let encoded_bytes = general_purpose::STANDARD_NO_PAD.encode(bytes);
-                    let page = page.replace("${bytes}", encoded_bytes.as_str());
-                    page.replace("${secret}", &net_traits::PRIVILEGED_SECRET.to_string())
+                    let page = page.replace("${secret}", &net_traits::PRIVILEGED_SECRET.to_string());
+                    let page = page.replace("${bytes}", &escape_html(encoded_bytes.as_str()));
+                    page.replace("${reason}", &escape_html(&reason))
                 },
                 NetworkError::BlobURLStoreError(reason) |
                 NetworkError::WebsocketConnectionFailure(reason) |
@@ -1568,7 +1568,7 @@ impl ParserContext {
                 NetworkError::ResourceLoadError(reason) |
                 NetworkError::MimeType(reason) => {
                     let page = resources::read_string(Resource::NetErrorHTML);
-                    page.replace("${reason}", &reason)
+                    page.replace("${reason}", &escape_html(&reason))
                 },
                 NetworkError::Crash(details) => {
                     let page = resources::read_string(Resource::CrashHTML);
@@ -1599,7 +1599,7 @@ impl ParserContext {
                 NetworkError::ProtocolHandlerSubstitutionError |
                 NetworkError::DecompressionError => {
                     let page = resources::read_string(Resource::NetErrorHTML);
-                    page.replace("${reason}", &format!("{:?}", error))
+                    page.replace("${reason}", &escape_html(&format!("{:?}", error)))
                 },
                 NetworkError::LoadCancelled => {
                     // The next load will show a page
@@ -2435,6 +2435,21 @@ fn populate_about_blank(cx: &mut JSContext, document: &Document) {
     let _ = html.upcast::<Node>().AppendChild(cx, body.upcast());
 }
 
+fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 impl Document {
     /// <https://html.spec.whatwg.org/multipage/#internal-ancestor-origin-objects-list-creation-steps>
     fn internal_ancestor_origin_objects_list_creation_steps(
@@ -2500,5 +2515,19 @@ impl Document {
         }
         // Step 5. Return a new DOMStringList object whose associated list is output.
         DOMStringList::new(cx, &self.global(), output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_html;
+
+    #[test]
+    fn escape_html_escapes_special_characters() {
+        assert_eq!(
+            escape_html("<script>alert(\"x\" & 'y')</script>"),
+            "&lt;script&gt;alert(&quot;x&quot; &amp; &#39;y&#39;)&lt;/script&gt;"
+        );
+        assert_eq!(escape_html("ConnectionFailure"), "ConnectionFailure");
     }
 }

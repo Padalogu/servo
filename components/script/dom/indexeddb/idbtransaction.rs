@@ -141,10 +141,10 @@ impl IDBTransaction {
         mode: IDBTransactionMode,
         durability: IDBTransactionDurability,
         scope: &DOMStringList,
-    ) -> DomRoot<IDBTransaction> {
+    ) -> Fallible<DomRoot<IDBTransaction>> {
         let serial_number =
-            IDBTransaction::create_transaction(global, connection.get_name(), mode, scope);
-        IDBTransaction::new_with_serial(
+            IDBTransaction::create_transaction(global, connection.get_name(), mode, scope)?;
+        Ok(IDBTransaction::new_with_serial(
             cx,
             global,
             connection,
@@ -152,7 +152,7 @@ impl IDBTransaction {
             durability,
             scope,
             serial_number,
-        )
+        ))
     }
 
     pub(crate) fn new_with_serial(
@@ -182,7 +182,7 @@ impl IDBTransaction {
         db_name: DOMString,
         mode: IDBTransactionMode,
         scope: &DOMStringList,
-    ) -> u64 {
+    ) -> Fallible<u64> {
         let backend_mode = match mode {
             IDBTransactionMode::Readonly => IndexedDBTxnMode::Readonly,
             IDBTransactionMode::Readwrite => IndexedDBTxnMode::Readwrite,
@@ -192,9 +192,10 @@ impl IDBTransaction {
             .filter_map(|i| scope.Item(i))
             .map(String::from)
             .collect();
-        let (sender, receiver) = channel(global.time_profiler_chan().clone()).unwrap();
+        let (sender, receiver) = channel(global.time_profiler_chan().clone())
+            .ok_or(Error::InvalidState(None))?;
 
-        global
+        if global
             .storage_threads()
             .send(IndexedDBThreadMsg::Sync(SyncOperation::CreateTransaction {
                 sender,
@@ -203,9 +204,23 @@ impl IDBTransaction {
                 mode: backend_mode,
                 scope,
             }))
-            .expect("Failed to send IndexedDBThreadMsg::Sync");
+            .is_err()
+        {
+            return Err(Error::InvalidState(Some(
+                "IndexedDB storage thread unavailable".into(),
+            )));
+        }
 
-        receiver.recv().unwrap().expect("CreateTransaction failed")
+        match receiver.recv() {
+            Ok(Ok(serial)) => Ok(serial),
+            Ok(Err(BackendError::DbNotFound)) => Err(Error::InvalidState(Some(
+                "Database connection has been closed or deleted".into(),
+            ))),
+            Ok(Err(err)) => Err(map_backend_error_to_dom_error(err)),
+            Err(_) => Err(Error::InvalidState(Some(
+                "IndexedDB transaction creation channel closed".into(),
+            ))),
+        }
     }
 
     /// <https://w3c.github.io/IndexedDB/#transaction-lifecycle>

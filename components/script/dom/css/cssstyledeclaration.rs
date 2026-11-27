@@ -293,9 +293,8 @@ impl CSSStyleDeclaration {
                 if !node.is_connected() {
                     return DOMString::new();
                 }
-                let addr = node.to_trusted_node_address();
                 node.owner_window()
-                    .resolved_style_query(addr, self.pseudo, property)
+                    .resolved_style_query(el, self.pseudo, property)
             },
             CSSStyleOwner::Null => DOMString::new(),
         }

@@ -149,28 +149,27 @@ impl ValidityState {
         self.invalid_flags.get()
     }
 
-    pub(crate) fn update_pseudo_classes(&self, cx: &mut JSContext) {
-        if self.element.is_instance_validatable(cx.no_gc()) {
-            let is_valid = self.invalid_flags.get().is_empty();
-            self.element
-                .set_state(cx.no_gc(), ElementState::VALID, is_valid);
-            self.element
-                .set_state(cx.no_gc(), ElementState::INVALID, !is_valid);
+    pub(crate) fn update_pseudo_classes_for_element(
+        cx: &mut JSContext,
+        element: &Element,
+        compute_is_valid: impl FnOnce(&mut JSContext) -> bool,
+    ) {
+        if element.is_instance_validatable(cx.no_gc()) {
+            let is_valid = compute_is_valid(cx);
+            element.set_state(cx.no_gc(), ElementState::VALID, is_valid);
+            element.set_state(cx.no_gc(), ElementState::INVALID, !is_valid);
         } else {
-            self.element
-                .set_state(cx.no_gc(), ElementState::VALID, false);
-            self.element
-                .set_state(cx.no_gc(), ElementState::INVALID, false);
+            element.set_state(cx.no_gc(), ElementState::VALID, false);
+            element.set_state(cx.no_gc(), ElementState::INVALID, false);
         }
 
-        if let Some(form_control) = self.element.as_maybe_form_control() &&
+        if let Some(form_control) = element.as_maybe_form_control() &&
             let Some(form_owner) = form_control.form_owner()
         {
             form_owner.update_validity(cx);
         }
 
-        if let Some(fieldset) = self
-            .element
+        if let Some(fieldset) = element
             .upcast::<Node>()
             .ancestors_unrooted(cx.no_gc())
             .find_map(UnrootedDom::downcast::<HTMLFieldSetElement>)
@@ -178,6 +177,12 @@ impl ValidityState {
         {
             fieldset.update_validity(cx);
         }
+    }
+
+    pub(crate) fn update_pseudo_classes(&self, cx: &mut JSContext) {
+        Self::update_pseudo_classes_for_element(cx, &self.element, |_| {
+            self.invalid_flags.get().is_empty()
+        });
     }
 }
 

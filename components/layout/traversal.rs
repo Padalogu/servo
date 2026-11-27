@@ -26,10 +26,6 @@ impl<'a> RecalcStyle<'a> {
     pub(crate) fn new(context: &'a LayoutContext<'a>) -> Self {
         RecalcStyle { context }
     }
-
-    pub(crate) fn context(&self) -> &LayoutContext<'a> {
-        self.context
-    }
 }
 
 impl<'dom, E> DomTraversal<E> for RecalcStyle<'_>
@@ -195,8 +191,10 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
     #[expect(unsafe_code)]
     unsafe {
         let dangerous_style_element = element.dangerous_style_element();
-        has_dirty_descendants = dangerous_style_element.has_dirty_descendants();
+        has_dirty_descendants = dangerous_style_element.has_dirty_descendants() ||
+            element.has_dirty_layout_descendants();
         dangerous_style_element.unset_dirty_descendants();
+        element.unset_has_dirty_layout_descendants();
     };
 
     if is_display_none {

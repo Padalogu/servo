@@ -194,7 +194,7 @@ partial interface Document {
   undefined releaseEvents();
 
   // Tracking issue for document.all: https://github.com/servo/servo/issues/7396
-  // readonly attribute HTMLAllCollection all;
+  [SameObject] readonly attribute HTMLAllCollection all;
 };
 
 // https://fullscreen.spec.whatwg.org/#api
@@ -220,11 +220,6 @@ partial interface Document {
 //   sequence<ShadowRoot> shadowRoots = [];
 // };
 
-// https://w3c.github.io/selection-api/#dom-document
-partial interface Document {
-  Selection? getSelection();
-};
-
 // https://drafts.csswg.org/web-animations-1/#extensions-to-the-document-interface
 partial interface Document {
     readonly attribute DocumentTimeline timeline;
@@ -243,4 +238,10 @@ typedef (WindowProxy or Element or HTMLCollection) NamedPropertyValue;
 partial interface Document {
   [Throws]
   static Document parseHTML(DOMString html, optional SetHTMLOptions options = {});
+};
+
+// https://privacycg.github.io/storage-access/#the-document-interface
+partial interface Document {
+  Promise<boolean> hasStorageAccess();
+  Promise<undefined> requestStorageAccess();
 };

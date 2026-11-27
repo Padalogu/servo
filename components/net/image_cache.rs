@@ -18,7 +18,8 @@ use mime::Mime;
 use net_traits::image_cache::{
     FontResolver, Image, ImageCache, ImageCacheFactory, ImageCacheResponseCallback,
     ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener, ImageOrMetadataAvailable,
-    ImageResponse, PendingImageId, RasterizationCompleteResponse, RasterizationResult, VectorImage,
+    ImageResponse, MaskImageMode, PendingImageId, RasterizationCompleteResponse,
+    RasterizationResult, VectorImage,
 };
 use net_traits::request::CorsSettings;
 use net_traits::{FetchResponseMsg, Metadata, NetworkError};
@@ -67,6 +68,12 @@ const FALLBACK_RIPPY: &[u8] = include_bytes!("resources/rippy.png");
 /// test uses very large values for viewBox. Hence, we just clamp the maximum
 /// width/height of the pixmap allocated for rasterization.
 const MAX_SVG_PIXMAP_DIMENSION: u32 = 5000;
+
+/// Maximum total decoded bitmap bytes retained per [`ImageCacheStore`] before LRU eviction.
+const MAX_DECODED_IMAGE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Maximum number of synthetic `R8` mask textures retained per [`ImageCacheStore`].
+const MAX_SYNTHETIC_R8_MASK_CACHE_ENTRIES: usize = 64;
 
 //
 // TODO(gw): Remaining work on image cache:
@@ -139,6 +146,119 @@ fn set_webrender_image_key(
 
     paint_api.add_image(image_key, descriptor, data, should_be_cached);
     image.id = Some(image_key);
+}
+
+fn raster_image_decoded_bytes(image: &RasterImage) -> usize {
+    image.bytes.len()
+}
+
+/// Convert frame 0 of a decoded/rasterized image into tightly packed single-channel `R8` bytes
+/// for WebRender `ImageMaskClip` (`ps_quad` samples `.rrrr` from the mask texture).
+fn extract_r8_mask_bytes(image: &RasterImage, mode: MaskImageMode) -> Option<Vec<u8>> {
+    let frame = image.frame_data(0)?;
+    let bytes = image.bytes.get(frame.byte_range.clone())?;
+    let width = image.metadata.width as usize;
+    let height = image.metadata.height as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixel_count = width.checked_mul(height)?;
+
+    match mode {
+        MaskImageMode::Alpha => match image.format {
+            PixelFormat::RGBA8 | PixelFormat::BGRA8 => {
+                if bytes.len() < pixel_count.checked_mul(4)? {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(pixel_count);
+                for px in bytes[..pixel_count * 4].chunks_exact(4) {
+                    out.push(px[3]);
+                }
+                Some(out)
+            },
+            PixelFormat::RGB8 => {
+                if bytes.len() < pixel_count.checked_mul(3)? {
+                    return None;
+                }
+                Some(vec![255u8; pixel_count])
+            },
+            PixelFormat::K8 => {
+                if bytes.len() < pixel_count {
+                    return None;
+                }
+                Some(vec![255u8; pixel_count])
+            },
+            PixelFormat::KA8 => {
+                if bytes.len() < pixel_count.checked_mul(2)? {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(pixel_count);
+                for px in bytes[..pixel_count * 2].chunks_exact(2) {
+                    out.push(px[1]);
+                }
+                Some(out)
+            },
+        },
+        MaskImageMode::Luminance => match image.format {
+            PixelFormat::RGBA8 => {
+                if bytes.len() < pixel_count.checked_mul(4)? {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(pixel_count);
+                for px in bytes[..pixel_count * 4].chunks_exact(4) {
+                    // Stored pixels are already premultiplied by alpha, matching CSS Masking 1 §7.7.
+                    let lum = (54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32 + 128) >> 8;
+                    out.push(lum.min(255) as u8);
+                }
+                Some(out)
+            },
+            PixelFormat::BGRA8 => {
+                if bytes.len() < pixel_count.checked_mul(4)? {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(pixel_count);
+                for px in bytes[..pixel_count * 4].chunks_exact(4) {
+                    let lum = (54 * px[2] as u32 + 183 * px[1] as u32 + 19 * px[0] as u32 + 128) >> 8;
+                    out.push(lum.min(255) as u8);
+                }
+                Some(out)
+            },
+            PixelFormat::RGB8 => {
+                if bytes.len() < pixel_count.checked_mul(3)? {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(pixel_count);
+                for px in bytes[..pixel_count * 3].chunks_exact(3) {
+                    let lum = (54 * px[0] as u32 + 183 * px[1] as u32 + 19 * px[2] as u32 + 128) >> 8;
+                    out.push(lum.min(255) as u8);
+                }
+                Some(out)
+            },
+            PixelFormat::K8 => {
+                if bytes.len() < pixel_count {
+                    return None;
+                }
+                Some(bytes[..pixel_count].to_vec())
+            },
+            PixelFormat::KA8 => {
+                if bytes.len() < pixel_count.checked_mul(2)? {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(pixel_count);
+                for px in bytes[..pixel_count * 2].chunks_exact(2) {
+                    out.push(pixels::multiply_u8_color(px[0], px[1]));
+                }
+                Some(out)
+            },
+        },
+    }
+}
+
+fn completed_load_decoded_bytes(image_response: &ImageResponse) -> usize {
+    match image_response {
+        ImageResponse::Loaded(Image::Raster(image), _) => raster_image_decoded_bytes(image),
+        _ => 0,
+    }
 }
 
 // ======================================================================
@@ -237,11 +357,23 @@ enum CacheResult<'a> {
 struct CompletedLoad {
     image_response: ImageResponse,
     id: PendingImageId,
+    decoded_bytes: usize,
+    last_used_seq: u64,
 }
 
 impl CompletedLoad {
-    fn new(image_response: ImageResponse, id: PendingImageId) -> CompletedLoad {
-        CompletedLoad { image_response, id }
+    fn new(
+        image_response: ImageResponse,
+        id: PendingImageId,
+        decoded_bytes: usize,
+        last_used_seq: u64,
+    ) -> CompletedLoad {
+        CompletedLoad {
+            image_response,
+            id,
+            decoded_bytes,
+            last_used_seq,
+        }
     }
 }
 
@@ -408,6 +540,18 @@ struct RasterizationTask {
     #[ignore_malloc_size_of = "Fn is difficult to measure"]
     listeners: Vec<(PipelineId, ImageCacheResponseCallback)>,
     result: Option<RasterImage>,
+    decoded_bytes: usize,
+    last_used_seq: u64,
+}
+
+enum ProtectedLruEntry<'a> {
+    Completed(&'a ImageKey),
+    RasterizedSvg(PendingImageId, DeviceIntSize),
+}
+
+enum LruEvictionCandidate {
+    Completed(ImageKey),
+    RasterizedSvg(PendingImageId, DeviceIntSize),
 }
 
 /// Used for storing images that do not have a `WebRenderImageKey` yet.
@@ -490,6 +634,12 @@ impl SvgRasterizationTaskStore {
     }
 }
 
+#[derive(Clone, Copy, MallocSizeOf)]
+struct SyntheticR8MaskEntry {
+    image_key: WebRenderImageKey,
+    last_used_seq: u64,
+}
+
 /// ## Image cache implementation.
 #[derive(MallocSizeOf)]
 struct ImageCacheStore {
@@ -512,6 +662,18 @@ struct ImageCacheStore {
     /// Maps a pending image id to a set of sizes for which that image was requested
     svg_rasterization_task_store: SvgRasterizationTaskStore,
 
+    /// Maps an `SVGSVGElement` uuid to its latest completed `PendingImageId`
+    svg_id_image_id_map: FxHashMap<Uuid, PendingImageId>,
+
+    /// Maps in-flight SVG rasterization `PendingImageId`s back to their `SVGSVGElement` uuid
+    pending_svg_ids: FxHashMap<PendingImageId, Uuid>,
+
+    /// Maps `(source_image_key, mask_mode)` to its cached single-channel `R8` WebRender mask key.
+    mask_image_keys: FxHashMap<(WebRenderImageKey, MaskImageMode), WebRenderImageKey>,
+
+    /// Bounded LRU cache mapping synthetic mask hashes to single-channel `R8` WebRender keys.
+    r8_mask_image_keys: FxHashMap<u64, SyntheticR8MaskEntry>,
+
     /// The [`RasterImage`] used for the broken image icon, initialized lazily, only when necessary.
     #[conditional_malloc_size_of]
     broken_image_icon_image: OnceCell<Option<Arc<RasterImage>>>,
@@ -528,6 +690,16 @@ struct ImageCacheStore {
     /// Main struct to handle the cache of `WebRenderImageKey` and
     /// images that do not have a key yet.
     key_cache: KeyCache,
+
+    /// Maximum decoded bitmap bytes allowed in this store before LRU eviction.
+    max_decoded_bytes: usize,
+
+    /// Total decoded bitmap bytes currently retained across `completed_loads`
+    /// and `rasterized_vector_images`.
+    total_decoded_bytes: usize,
+
+    /// Monotonic counter used to track least-recently-used access ordering.
+    lru_seq_counter: u64,
 }
 
 impl ImageCacheStore {
@@ -642,6 +814,81 @@ impl ImageCacheStore {
         }
     }
 
+    fn next_lru_seq(&mut self) -> u64 {
+        self.lru_seq_counter = self.lru_seq_counter.wrapping_add(1);
+        self.lru_seq_counter
+    }
+
+    fn evict_lru_if_needed(&mut self, protected: Option<ProtectedLruEntry<'_>>) {
+        if self.total_decoded_bytes <= self.max_decoded_bytes {
+            return;
+        }
+
+        let mut candidates: Vec<(u64, LruEvictionCandidate)> = self
+            .completed_loads
+            .iter()
+            .filter_map(|(key, load)| {
+                if load.decoded_bytes == 0 {
+                    return None;
+                }
+                if matches!(protected, Some(ProtectedLruEntry::Completed(p)) if p == key) {
+                    return None;
+                }
+                match &load.image_response {
+                    ImageResponse::Loaded(Image::Raster(image), _) if !image.should_animate() => {
+                        Some((
+                            load.last_used_seq,
+                            LruEvictionCandidate::Completed(key.clone()),
+                        ))
+                    },
+                    _ => None,
+                }
+            })
+            .chain(self.rasterized_vector_images.iter().filter_map(
+                |(&(image_id, size), task)| {
+                    if task.decoded_bytes == 0 {
+                        return None;
+                    }
+                    if matches!(
+                        protected,
+                        Some(ProtectedLruEntry::RasterizedSvg(pid, psize))
+                            if pid == image_id && psize == size
+                    ) {
+                        return None;
+                    }
+                    if task
+                        .result
+                        .as_ref()
+                        .is_some_and(|image| !image.should_animate())
+                    {
+                        Some((
+                            task.last_used_seq,
+                            LruEvictionCandidate::RasterizedSvg(image_id, size),
+                        ))
+                    } else {
+                        None
+                    }
+                },
+            ))
+            .collect();
+
+        candidates.sort_unstable_by_key(|(seq, _)| *seq);
+
+        for (_, candidate) in candidates {
+            if self.total_decoded_bytes <= self.max_decoded_bytes {
+                break;
+            }
+            match candidate {
+                LruEvictionCandidate::Completed((url, origin, cors_setting)) => {
+                    self.remove_loaded_image(&url, &origin, &cors_setting);
+                },
+                LruEvictionCandidate::RasterizedSvg(image_id, size) => {
+                    self.remove_rasterized_vector_image(&image_id, &size);
+                },
+            }
+        }
+    }
+
     /// Complete the loading the of the rasterized svg image. This needs the `RasterImage` to
     /// already have a `WebRenderImageKey`.
     fn complete_load_svg(
@@ -650,15 +897,37 @@ impl ImageCacheStore {
         pending_image_id: PendingImageId,
         requested_size: DeviceIntSize,
     ) {
-        let listeners = {
-            self.rasterized_vector_images
-                .get_mut(&(pending_image_id, requested_size))
-                .map(|task| {
-                    task.result = Some(rasterized_image);
-                    std::mem::take(&mut task.listeners)
-                })
-                .unwrap_or_default()
+        let decoded_bytes = raster_image_decoded_bytes(&rasterized_image);
+        let seq = self.next_lru_seq();
+        let mut added_bytes = 0usize;
+        let mut replaced_bytes = 0usize;
+        let mut replaced_wr_key = None;
+        let listeners = if let Some(task) = self
+            .rasterized_vector_images
+            .get_mut(&(pending_image_id, requested_size))
+        {
+            if let Some(prev) = task.result.replace(rasterized_image) {
+                replaced_bytes = task.decoded_bytes;
+                replaced_wr_key = prev.id;
+            }
+            task.decoded_bytes = decoded_bytes;
+            task.last_used_seq = seq;
+            added_bytes = decoded_bytes;
+            std::mem::take(&mut task.listeners)
+        } else {
+            Vec::new()
         };
+        self.total_decoded_bytes = self
+            .total_decoded_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(added_bytes);
+        if let Some(wr_key) = replaced_wr_key {
+            self.paint_api.update_images(
+                self.webview_id.into(),
+                vec![ImageUpdate::DeleteImage(wr_key)].into(),
+            );
+            self.delete_mask_images_for_source(wr_key);
+        }
 
         for (pipeline_id, callback) in listeners {
             callback(ImageCacheResponseMessage::VectorImageRasterizationComplete(
@@ -669,6 +938,30 @@ impl ImageCacheStore {
                 },
             ));
         }
+
+        if let Some(svg_id) = self.pending_svg_ids.remove(&pending_image_id) {
+            if let Some(old_mapped_image_id) =
+                self.svg_id_image_id_map.insert(svg_id, pending_image_id) &&
+                old_mapped_image_id != pending_image_id
+            {
+                self.vector_images.remove(&old_mapped_image_id);
+                let old_sizes: Vec<DeviceIntSize> = self
+                    .rasterized_vector_images
+                    .keys()
+                    .filter_map(|(id, size)| (*id == old_mapped_image_id).then_some(*size))
+                    .collect();
+                for size in old_sizes {
+                    self.remove_rasterized_vector_image(&old_mapped_image_id, &size);
+                }
+                self.svg_rasterization_task_store
+                    .remove_all_for_id(old_mapped_image_id);
+            }
+        }
+
+        self.evict_lru_if_needed(Some(ProtectedLruEntry::RasterizedSvg(
+            pending_image_id,
+            requested_size,
+        )));
     }
 
     /// The rest of complete load. This requires that images have a valid `WebRenderImageKey`.
@@ -705,18 +998,49 @@ impl ImageCacheStore {
             LoadResult::FailedToLoadOrDecode => ImageResponse::FailedToLoadOrDecode,
         };
 
-        let completed_load = CompletedLoad::new(image_response.clone(), key);
-        self.completed_loads.insert(
-            (
-                pending_load.url,
-                pending_load.load_origin,
-                pending_load.cors_setting,
-            ),
-            completed_load,
+        let decoded_bytes = completed_load_decoded_bytes(&image_response);
+        let seq = self.next_lru_seq();
+        let completed_load = CompletedLoad::new(image_response.clone(), key, decoded_bytes, seq);
+        let cache_key = (
+            pending_load.url,
+            pending_load.load_origin,
+            pending_load.cors_setting,
         );
+        if let Some(previous) = self
+            .completed_loads
+            .insert(cache_key.clone(), completed_load)
+        {
+            self.total_decoded_bytes = self
+                .total_decoded_bytes
+                .saturating_sub(previous.decoded_bytes);
+            if let ImageResponse::Loaded(Image::Raster(image), _) = previous.image_response &&
+                let Some(id) = image.id
+            {
+                self.paint_api.update_images(
+                    self.webview_id.into(),
+                    vec![ImageUpdate::DeleteImage(id)].into(),
+                );
+            }
+        }
+        self.total_decoded_bytes = self.total_decoded_bytes.saturating_add(decoded_bytes);
 
         for listener in pending_load.listeners {
             listener.respond(image_response.clone());
+        }
+
+        self.evict_lru_if_needed(Some(ProtectedLruEntry::Completed(&cache_key)));
+    }
+
+    fn delete_mask_images_for_source(&mut self, source_key: WebRenderImageKey) {
+        let mut deletions = smallvec::SmallVec::<[ImageUpdate; 1]>::new();
+        for mode in [MaskImageMode::Alpha, MaskImageMode::Luminance] {
+            if let Some(mask_key) = self.mask_image_keys.remove(&(source_key, mode)) {
+                deletions.push(ImageUpdate::DeleteImage(mask_key));
+            }
+        }
+        if !deletions.is_empty() {
+            self.paint_api
+                .update_images(self.webview_id.into(), deletions);
         }
     }
 
@@ -728,14 +1052,20 @@ impl ImageCacheStore {
     ) {
         if let Some(loaded_image) =
             self.completed_loads
-                .remove(&(url.clone(), origin.clone(), *cors_setting)) &&
-            let ImageResponse::Loaded(Image::Raster(image), _) = loaded_image.image_response &&
-            let Some(id) = image.id
+                .remove(&(url.clone(), origin.clone(), *cors_setting))
         {
-            self.paint_api.update_images(
-                self.webview_id.into(),
-                vec![ImageUpdate::DeleteImage(id)].into(),
-            );
+            self.total_decoded_bytes = self
+                .total_decoded_bytes
+                .saturating_sub(loaded_image.decoded_bytes);
+            if let ImageResponse::Loaded(Image::Raster(image), _) = loaded_image.image_response &&
+                let Some(id) = image.id
+            {
+                self.paint_api.update_images(
+                    self.webview_id.into(),
+                    vec![ImageUpdate::DeleteImage(id)].into(),
+                );
+                self.delete_mask_images_for_source(id);
+            }
         }
     }
 
@@ -748,12 +1078,16 @@ impl ImageCacheStore {
             .rasterized_vector_images
             .remove(&(*image_id, *device_size))
         {
+            self.total_decoded_bytes = self
+                .total_decoded_bytes
+                .saturating_sub(entry.decoded_bytes);
             if let Some(result) = entry.result {
                 if let Some(image_id) = result.id {
                     self.paint_api.update_images(
                         self.webview_id.into(),
                         vec![ImageUpdate::DeleteImage(image_id)].into(),
                     );
+                    self.delete_mask_images_for_source(image_id);
                 }
             } else {
                 // If there is no corresponding rasterized_vector_image result,
@@ -774,17 +1108,20 @@ impl ImageCacheStore {
     /// Return a completed image if it exists, or None if there is no complete load
     /// or the complete load is not fully decoded or is unavailable.
     fn get_completed_image_if_available(
-        &self,
+        &mut self,
         url: ServoUrl,
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> Option<Result<(Image, ServoUrl), ()>> {
-        self.completed_loads
-            .get(&(url, origin, cors_setting))
-            .map(|completed_load| match &completed_load.image_response {
-                ImageResponse::Loaded(image, url) => Ok((image.clone(), url.clone())),
-                ImageResponse::FailedToLoadOrDecode | ImageResponse::MetadataLoaded(_) => Err(()),
-            })
+        let completed_load = self
+            .completed_loads
+            .get_mut(&(url, origin, cors_setting))?;
+        self.lru_seq_counter = self.lru_seq_counter.wrapping_add(1);
+        completed_load.last_used_seq = self.lru_seq_counter;
+        Some(match &completed_load.image_response {
+            ImageResponse::Loaded(image, url) => Ok((image.clone(), url.clone())),
+            ImageResponse::FailedToLoadOrDecode | ImageResponse::MetadataLoaded(_) => Err(()),
+        })
     }
 
     /// Handle a message from one of the decoder worker threads or from a sync
@@ -809,6 +1146,8 @@ pub struct ImageCacheFactoryImpl {
     broken_image_icon_data: Arc<Vec<u8>>,
     /// Thread pool for image decoding
     thread_pool: Arc<ThreadPool>,
+    /// Maximum decoded bitmap bytes per created `ImageCacheStore`.
+    max_decoded_bytes: usize,
 }
 
 impl ImageCacheFactoryImpl {
@@ -818,18 +1157,34 @@ impl ImageCacheFactoryImpl {
         Self {
             broken_image_icon_data: Arc::new(broken_image_icon_data),
             thread_pool: ThreadPool::global(),
+            max_decoded_bytes: MAX_DECODED_IMAGE_CACHE_BYTES,
         }
     }
-}
 
-impl ImageCacheFactory for ImageCacheFactoryImpl {
-    fn create(
+    #[cfg(feature = "test-util")]
+    pub fn with_max_decoded_bytes(mut self, max_decoded_bytes: usize) -> Self {
+        self.max_decoded_bytes = max_decoded_bytes;
+        self
+    }
+
+    #[cfg(feature = "test-util")]
+    pub fn create_store_cache_for_test(
         &self,
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         paint_api: &CrossProcessPaintApi,
         font_resolver: Arc<dyn FontResolver>,
-    ) -> Arc<dyn ImageCache> {
+    ) -> Arc<ImageCacheImpl> {
+        self.create_impl(webview_id, pipeline_id, paint_api, font_resolver)
+    }
+
+    fn create_impl(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        paint_api: &CrossProcessPaintApi,
+        font_resolver: Arc<dyn FontResolver>,
+    ) -> Arc<ImageCacheImpl> {
         let image_string_href_resolver = Box::new(move |_: &str, _: &usvg::Options| {
             // Do not try to load `href` in <image> as local file path.
             None
@@ -865,8 +1220,14 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
                 webview_id,
                 key_cache: KeyCache::new(),
                 svg_rasterization_task_store: SvgRasterizationTaskStore::default(),
+                svg_id_image_id_map: FxHashMap::default(),
+                pending_svg_ids: FxHashMap::default(),
+                mask_image_keys: FxHashMap::default(),
+                r8_mask_image_keys: FxHashMap::default(),
+                max_decoded_bytes: self.max_decoded_bytes,
+                total_decoded_bytes: 0,
+                lru_seq_counter: 0,
             })),
-            svg_id_image_id_map: Arc::new(Mutex::new(FxHashMap::default())),
             broken_image_icon_data: self.broken_image_icon_data.clone(),
             thread_pool: self.thread_pool.clone(),
             usvg_options: Arc::new(opt),
@@ -875,11 +1236,21 @@ impl ImageCacheFactory for ImageCacheFactoryImpl {
     }
 }
 
+impl ImageCacheFactory for ImageCacheFactoryImpl {
+    fn create(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        paint_api: &CrossProcessPaintApi,
+        font_resolver: Arc<dyn FontResolver>,
+    ) -> Arc<dyn ImageCache> {
+        self.create_impl(webview_id, pipeline_id, paint_api, font_resolver)
+    }
+}
+
 pub struct ImageCacheImpl {
     /// Per-[`ImageCache`] data.
     store: Arc<Mutex<ImageCacheStore>>,
-    /// Maps an SVGElement uuid to a pending image id in the store
-    svg_id_image_id_map: Arc<Mutex<FxHashMap<Uuid, PendingImageId>>>,
     /// The data to use for the broken image icon used when images cannot load.
     broken_image_icon_data: Arc<Vec<u8>>,
     /// Thread pool for image decoding. This is shared with other [`ImageCache`]s in the
@@ -898,18 +1269,12 @@ impl ImageCache for ImageCacheImpl {
         let store_size = self.store.lock().size_of(ops);
         let fontdb_size = self.usvg_options.conditional_size_of(ops);
         let broken_image_size = self.broken_image_icon_data.conditional_size_of(ops);
-        let svg_id_map = self.svg_id_image_id_map.conditional_size_of(ops);
         let svg_font_resolver = self.usvg_font_resolver.size_of(ops);
         vec![
             Report {
                 path: path![prefix, "image-cache", "cache"],
                 kind: ReportKind::ExplicitSystemHeapSize,
                 size: store_size,
-            },
-            Report {
-                path: path![prefix, "image-cache", "svg_id_map"],
-                kind: ReportKind::ExplicitSystemHeapSize,
-                size: svg_id_map,
             },
             Report {
                 path: path![prefix, "image-cache", "broken_image_icon"],
@@ -955,7 +1320,7 @@ impl ImageCache for ImageCacheImpl {
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
     ) -> Option<Image> {
-        let store = self.store.lock();
+        let mut store = self.store.lock();
         let result = store.get_completed_image_if_available(url, origin, cors_setting);
         match result {
             Some(Ok((img, _))) => Some(img),
@@ -1067,26 +1432,37 @@ impl ImageCache for ImageCacheImpl {
         // This early return relies on the fact that the result of image rasterization cannot
         // ever be `None`. If that were the case we would need to check whether the entry
         // in the `HashMap` was `Occupied` or not.
+        let next_seq = store.lru_seq_counter.wrapping_add(1);
         let entry = store
             .rasterized_vector_images
             .entry((image_id, requested_size))
             .or_default();
         if let Some(result) = entry.result.as_ref() {
-            return RasterizationResult::Image(result.clone());
+            entry.last_used_seq = next_seq;
+            let image = result.clone();
+            store.lru_seq_counter = next_seq;
+            if let Some(svg_id) = svg_id &&
+                let Some(old_mapped_image_id) = store.svg_id_image_id_map.insert(svg_id, image_id) &&
+                old_mapped_image_id != image_id
+            {
+                store.vector_images.remove(&old_mapped_image_id);
+                let old_sizes: Vec<DeviceIntSize> = store
+                    .rasterized_vector_images
+                    .keys()
+                    .filter_map(|(id, size)| (*id == old_mapped_image_id).then_some(*size))
+                    .collect();
+                for size in old_sizes {
+                    store.remove_rasterized_vector_image(&old_mapped_image_id, &size);
+                }
+                store
+                    .svg_rasterization_task_store
+                    .remove_all_for_id(old_mapped_image_id);
+            }
+            return RasterizationResult::Image(image);
         }
 
-        if let Some(svg_id) = svg_id &&
-            let Some(old_mapped_image_id) =
-                self.svg_id_image_id_map.lock().insert(svg_id, image_id) &&
-            old_mapped_image_id != image_id
-        {
-            store.vector_images.remove(&old_mapped_image_id);
-            store
-                .rasterized_vector_images
-                .remove(&(old_mapped_image_id, requested_size));
-            store
-                .svg_rasterization_task_store
-                .remove_all_for_id(old_mapped_image_id);
+        if let Some(svg_id) = svg_id {
+            store.pending_svg_ids.insert(image_id, svg_id);
         }
 
         let natural_size = vector_image.svg_tree.size().to_int_size();
@@ -1197,9 +1573,15 @@ impl ImageCache for ImageCacheImpl {
                     store
                         .svg_rasterization_task_store
                         .remove_being_rasterized(image_id, requested_size);
-                    store
+                    store.pending_svg_ids.remove(&image_id);
+                    if let Some(removed) = store
                         .rasterized_vector_images
-                        .remove(&(image_id, requested_size));
+                        .remove(&(image_id, requested_size))
+                    {
+                        store.total_decoded_bytes = store
+                            .total_decoded_bytes
+                            .saturating_sub(removed.decoded_bytes);
+                    }
 
                     // Remove the `image_id` from `vector_images` so the check at the top of this
                     // method will fail for subsequent calls and won't trigger rasterization
@@ -1232,7 +1614,21 @@ impl ImageCache for ImageCacheImpl {
 
     fn evict_rasterized_image(&self, svg_id: &Uuid) {
         let mut store = self.store.lock();
-        if let Some(mapped_image_id) = self.svg_id_image_id_map.lock().remove(svg_id) {
+        let mut evicted_ids: Vec<PendingImageId> = Vec::new();
+        if let Some(mapped_image_id) = store.svg_id_image_id_map.remove(svg_id) {
+            evicted_ids.push(mapped_image_id);
+        }
+        store.pending_svg_ids.retain(|id, pending_svg_id| {
+            if pending_svg_id == svg_id {
+                if !evicted_ids.contains(id) {
+                    evicted_ids.push(*id);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for mapped_image_id in evicted_ids {
             store.pending_loads.remove(&mapped_image_id);
             store.vector_images.remove(&mapped_image_id);
             let images_to_remove = store
@@ -1244,7 +1640,39 @@ impl ImageCache for ImageCacheImpl {
             for (id, requested_size) in images_to_remove {
                 store.remove_rasterized_vector_image(&id, &requested_size);
             }
+            store
+                .svg_rasterization_task_store
+                .remove_all_for_id(mapped_image_id);
         }
+    }
+
+    fn get_last_rasterized_svg_image(
+        &self,
+        svg_id: &Uuid,
+        requested_size: DeviceIntSize,
+    ) -> Option<RasterImage> {
+        let mut store = self.store.lock();
+        let old_id = *store.svg_id_image_id_map.get(svg_id)?;
+        let next_seq = store.next_lru_seq();
+        if requested_size.width > 0 &&
+            requested_size.height > 0 &&
+            let Some(entry) = store.rasterized_vector_images.get_mut(&(old_id, requested_size)) &&
+            let Some(result) = entry.result.as_ref()
+        {
+            entry.last_used_seq = next_seq;
+            return Some(result.clone());
+        }
+        store
+            .rasterized_vector_images
+            .iter_mut()
+            .find_map(|((id, _), entry)| {
+                if *id == old_id && let Some(result) = entry.result.as_ref() {
+                    entry.last_used_seq = next_seq;
+                    Some(result.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     /// Inform the image cache about a response for a pending request.
@@ -1370,7 +1798,6 @@ impl ImageCache for ImageCacheImpl {
 
     fn clear(&self) {
         self.store.lock().clear();
-        *self.svg_id_image_id_map.lock() = Default::default();
     }
 
     fn get_broken_image_icon(&self) -> Option<Arc<RasterImage>> {
@@ -1389,9 +1816,142 @@ impl ImageCache for ImageCacheImpl {
             })
             .clone()
     }
+
+    fn get_or_create_mask_image_key(
+        &self,
+        source_image: &RasterImage,
+        mode: MaskImageMode,
+    ) -> Option<WebRenderImageKey> {
+        let source_key = source_image.id?;
+        {
+            let store = self.store.lock();
+            if let Some(&mask_key) = store.mask_image_keys.get(&(source_key, mode)) {
+                return Some(mask_key);
+            }
+        }
+
+        let mask_bytes = extract_r8_mask_bytes(source_image, mode)?;
+        let mut store = self.store.lock();
+        if let Some(&mask_key) = store.mask_image_keys.get(&(source_key, mode)) {
+            return Some(mask_key);
+        }
+
+        let mask_key = store.allocate_image_key_sync()?;
+
+        let descriptor = webrender_api::ImageDescriptor {
+            size: DeviceIntSize::new(
+                source_image.metadata.width as i32,
+                source_image.metadata.height as i32,
+            ),
+            stride: None,
+            format: webrender_api::ImageFormat::R8,
+            offset: 0,
+            flags: webrender_api::ImageDescriptorFlags::empty(),
+        };
+        let data = SerializableImageData::Raw(
+            servo_base::generic_channel::GenericSharedMemory::from_vec(mask_bytes),
+        );
+        store.paint_api.add_image(mask_key, descriptor, data, false);
+        store.mask_image_keys.insert((source_key, mode), mask_key);
+        Some(mask_key)
+    }
+
+    fn get_r8_mask_image_key(&self, cache_key: u64) -> Option<WebRenderImageKey> {
+        let mut store = self.store.lock();
+        let next_seq = store.lru_seq_counter.wrapping_add(1);
+        let entry = store.r8_mask_image_keys.get_mut(&cache_key)?;
+        entry.last_used_seq = next_seq;
+        let image_key = entry.image_key;
+        store.lru_seq_counter = next_seq;
+        Some(image_key)
+    }
+
+    fn get_or_create_r8_mask_image_key(
+        &self,
+        cache_key: u64,
+        size: DeviceIntSize,
+        data: &[u8],
+    ) -> Option<WebRenderImageKey> {
+        let width = usize::try_from(size.width).ok()?;
+        let height = usize::try_from(size.height).ok()?;
+        let pixel_count = width.checked_mul(height)?;
+        if pixel_count == 0 || data.len() != pixel_count {
+            return None;
+        }
+
+        let mut store = self.store.lock();
+        let next_seq = store.lru_seq_counter.wrapping_add(1);
+        if let Some(entry) = store.r8_mask_image_keys.get_mut(&cache_key) {
+            entry.last_used_seq = next_seq;
+            let image_key = entry.image_key;
+            store.lru_seq_counter = next_seq;
+            return Some(image_key);
+        }
+
+        let mask_key = store.allocate_image_key_sync()?;
+        let mut deletions = smallvec::SmallVec::<[ImageUpdate; 1]>::new();
+        while store.r8_mask_image_keys.len() >= MAX_SYNTHETIC_R8_MASK_CACHE_ENTRIES {
+            let Some(&oldest_key) = store
+                .r8_mask_image_keys
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_seq)
+                .map(|(key, _)| key)
+            else {
+                break;
+            };
+            if let Some(removed) = store.r8_mask_image_keys.remove(&oldest_key) {
+                deletions.push(ImageUpdate::DeleteImage(removed.image_key));
+            }
+        }
+        if !deletions.is_empty() {
+            store
+                .paint_api
+                .update_images(store.webview_id.into(), deletions);
+        }
+
+        let descriptor = webrender_api::ImageDescriptor {
+            size,
+            stride: None,
+            format: webrender_api::ImageFormat::R8,
+            offset: 0,
+            flags: webrender_api::ImageDescriptorFlags::empty(),
+        };
+        let image_data = SerializableImageData::Raw(
+            servo_base::generic_channel::GenericSharedMemory::from_vec(data.to_vec()),
+        );
+        store
+            .paint_api
+            .add_image(mask_key, descriptor, image_data, false);
+        let seq = store.next_lru_seq();
+        store.r8_mask_image_keys.insert(
+            cache_key,
+            SyntheticR8MaskEntry {
+                image_key: mask_key,
+                last_used_seq: seq,
+            },
+        );
+        Some(mask_key)
+    }
 }
 
 impl ImageCacheStore {
+    fn allocate_image_key_sync(&mut self) -> Option<WebRenderImageKey> {
+        match self.key_cache.cache {
+            KeyCacheState::Ready(ref mut cache) => {
+                if let Some(image_key) = cache.pop() {
+                    Some(image_key)
+                } else {
+                    self.fetch_more_image_keys();
+                    self.paint_api
+                        .generate_image_key_blocking(self.webview_id)
+                }
+            },
+            _ => self
+                .paint_api
+                .generate_image_key_blocking(self.webview_id),
+        }
+    }
+
     /// Clear the image cache.
     // Webrender currently does not care about keys that are loaded but do not have an image attached to it.
     fn clear(&mut self) {
@@ -1416,6 +1976,17 @@ impl ImageCacheStore {
                     .and_then(|icon| icon.id)
                     .map(ImageUpdate::DeleteImage),
             )
+            .chain(
+                self.mask_image_keys
+                    .values()
+                    .copied()
+                    .map(ImageUpdate::DeleteImage),
+            )
+            .chain(
+                self.r8_mask_image_keys
+                    .values()
+                    .map(|entry| ImageUpdate::DeleteImage(entry.image_key)),
+            )
             .collect();
         if !deletions.is_empty() {
             self.paint_api
@@ -1428,8 +1999,13 @@ impl ImageCacheStore {
         self.vector_images = Default::default();
         self.rasterized_vector_images = Default::default();
         self.svg_rasterization_task_store = Default::default();
+        self.svg_id_image_id_map = Default::default();
+        self.pending_svg_ids = Default::default();
+        self.mask_image_keys = Default::default();
+        self.r8_mask_image_keys = Default::default();
         self.pending_loads = Default::default();
         self.key_cache = Default::default();
+        self.total_decoded_bytes = 0;
 
         let _ = self.broken_image_icon_image.take();
     }
@@ -1438,6 +2014,17 @@ impl ImageCacheStore {
 impl Drop for ImageCacheStore {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+#[cfg(feature = "test-util")]
+impl ImageCacheImpl {
+    pub fn decoded_bytes(&self) -> usize {
+        self.store.lock().total_decoded_bytes
+    }
+
+    pub fn max_decoded_bytes(&self) -> usize {
+        self.store.lock().max_decoded_bytes
     }
 }
 
@@ -1452,8 +2039,12 @@ impl ImageCacheImpl {
             load.add_listener(listener);
             return;
         }
-        if let Some(load) = store.completed_loads.values().find(|l| l.id == id) {
-            listener.respond(load.image_response.clone());
+        let next_seq = store.lru_seq_counter.wrapping_add(1);
+        if let Some(load) = store.completed_loads.values_mut().find(|l| l.id == id) {
+            load.last_used_seq = next_seq;
+            let response = load.image_response.clone();
+            store.lru_seq_counter = next_seq;
+            listener.respond(response);
             return;
         }
         warn!("Couldn't find cached entry for listener {:?}", id);

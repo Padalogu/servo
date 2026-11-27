@@ -5,7 +5,7 @@
 // https://html.spec.whatwg.org/multipage/#htmlmediaelement
 
 enum CanPlayTypeResult { "" /* empty string */, "maybe", "probably" };
-typedef (MediaStream /*or MediaSource */ or Blob) MediaProvider;
+typedef (MediaStream or MediaSource or Blob) MediaProvider;
 
 [Exposed=Window, Abstract]
 interface HTMLMediaElement : HTMLElement {
@@ -63,4 +63,10 @@ interface HTMLMediaElement : HTMLElement {
   readonly attribute VideoTrackList videoTracks;
   readonly attribute TextTrackList textTracks;
   TextTrack addTextTrack(TextTrackKind kind, optional DOMString label = "", optional DOMString language = "");
+
+  // encrypted media
+  readonly attribute MediaKeys? mediaKeys;
+  attribute EventHandler onencrypted;
+  attribute EventHandler onwaitingforkey;
+  Promise<undefined> setMediaKeys(MediaKeys? mediaKeys);
 };

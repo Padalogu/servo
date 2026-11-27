@@ -143,6 +143,22 @@ pub fn content_process_sandbox_profile() {
     process::exit(1);
 }
 
+/// Returns the executable path to use when spawning a child copy of this binary.
+///
+/// On Linux, `/proc/self/exe` stays valid even if the on-disk executable is
+/// unlinked or replaced while running, whereas `env::current_exe()` can return
+/// a `... (deleted)` path that fails with `ENOENT`.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+fn current_executable_for_spawn() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if std::path::Path::new("/proc/self/exe").exists() {
+            return Ok(std::path::PathBuf::from("/proc/self/exe"));
+        }
+    }
+    env::current_exe()
+}
+
 #[cfg(any(
     target_os = "windows",
     target_os = "android",
@@ -156,22 +172,18 @@ pub fn spawn_multiprocess(
     content: UnprivilegedContent,
 ) -> Result<crate::process_manager::Process, ipc_channel::IpcError> {
     use ipc_channel::ipc::{IpcOneShotServer, IpcSender};
-    // Note that this function can panic, due to process creation,
-    // avoiding this panic would require a mechanism for dealing
-    // with low-resource scenarios.
-    let (server, token) = IpcOneShotServer::<IpcSender<UnprivilegedContent>>::new()
-        .expect("Failed to create IPC one-shot server.");
 
-    let path_to_self = env::current_exe().expect("Failed to get current executor.");
+    let (server, token) = IpcOneShotServer::<IpcSender<UnprivilegedContent>>::new()
+        .map_err(ipc_channel::IpcError::Io)?;
+
+    let path_to_self = current_executable_for_spawn().map_err(ipc_channel::IpcError::Io)?;
     let mut child_process = process::Command::new(path_to_self);
     setup_common(&mut child_process, token);
 
     #[allow(clippy::zombie_processes)]
-    let child = child_process
-        .spawn()
-        .expect("Failed to start unsandboxed child process!");
+    let child = child_process.spawn().map_err(ipc_channel::IpcError::Io)?;
 
-    let (_receiver, sender) = server.accept().expect("Server failed to accept.");
+    let (_receiver, sender) = server.accept()?;
     sender.send(content)?;
 
     Ok(crate::process_manager::Process::Unsandboxed(child))
@@ -213,37 +225,35 @@ pub fn spawn_multiprocess(
         }
     }
 
-    // Note that this function can panic, due to process creation,
-    // avoiding this panic would require a mechanism for dealing
-    // with low-resource scenarios.
     let (server, token) = IpcOneShotServer::<IpcSender<UnprivilegedContent>>::new()
-        .expect("Failed to create IPC one-shot server.");
+        .map_err(ipc_channel::IpcError::Io)?;
 
     // If there is a sandbox, use the `gaol` API to create the child process.
     let process = if content.opts().sandbox {
-        let mut command = sandbox::Command::me().expect("Failed to get current sandbox.");
+        let mut command = match current_executable_for_spawn() {
+            Ok(path_to_self) => sandbox::Command::new(path_to_self),
+            Err(_) => sandbox::Command::me().map_err(ipc_channel::IpcError::Io)?,
+        };
         setup_common(&mut command, token);
 
         let profile = content_process_sandbox_profile();
         crate::process_manager::Process::Sandboxed(
             Sandbox::new(profile)
                 .start(&mut command)
-                .expect("Failed to start sandboxed child process!")
+                .map_err(ipc_channel::IpcError::Io)?
                 .pid as u32,
         )
     } else {
-        let path_to_self = env::current_exe().expect("Failed to get current executor.");
+        let path_to_self = current_executable_for_spawn().map_err(ipc_channel::IpcError::Io)?;
         let mut child_process = process::Command::new(path_to_self);
         setup_common(&mut child_process, token);
 
         crate::process_manager::Process::Unsandboxed(
-            child_process
-                .spawn()
-                .expect("Failed to start unsandboxed child process!"),
+            child_process.spawn().map_err(ipc_channel::IpcError::Io)?,
         )
     };
 
-    let (_receiver, sender) = server.accept().expect("Server failed to accept.");
+    let (_receiver, sender) = server.accept()?;
     sender.send(content)?;
 
     Ok(process)
@@ -258,6 +268,7 @@ pub fn spawn_multiprocess(_content: UnprivilegedContent) -> Result<Process, Erro
 fn setup_common<C: CommandMethods>(command: &mut C, token: String) {
     C::arg(command, "--content-process");
     C::arg(command, token);
+    C::env(command, "ROVELO_PARENT_PID", process::id().to_string());
 
     if let Ok(value) = env::var("RUST_BACKTRACE") {
         C::env(command, "RUST_BACKTRACE", value);
@@ -296,5 +307,18 @@ impl CommandMethods for process::Command {
         U: AsRef<OsStr>,
     {
         self.env(key, val);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::current_executable_for_spawn;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn current_executable_for_spawn_returns_proc_self_exe_on_linux() {
+        let exe = current_executable_for_spawn()
+            .expect("current_executable_for_spawn should succeed on Linux");
+        assert_eq!(exe, std::path::PathBuf::from("/proc/self/exe"));
     }
 }

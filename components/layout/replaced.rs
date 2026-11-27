@@ -34,6 +34,7 @@ use style::values::computed::image::Image as ComputedImage;
 use style::values::computed::{Content, Context, ToComputedValue};
 use style::values::generics::counters::{GenericContentItem, GenericContentItems};
 use url::Url;
+use uuid::Uuid;
 use web_atoms::local_name;
 use webrender_api::ImageKey;
 
@@ -161,6 +162,7 @@ pub(crate) enum ReplacedContentKind {
     SVGElement {
         vector_image: Option<VectorImage>,
         has_viewbox: bool,
+        svg_id: Uuid,
     },
     Audio,
 }
@@ -295,19 +297,15 @@ impl ReplacedContents {
             ratio,
         };
 
-        let svg_source = match svg_data.source {
-            None => {
-                // The SVGSVGElement is not yet serialized, so we add it to a list
-                // and hand it over to script to peform the serialization.
-                context
-                    .image_resolver
-                    .queue_svg_element_for_serialization(node);
-                None
-            },
-            // If `svg_source_result` is `Err()`, it means that the previous attempt
-            // had errored, then don't attempt to serialize again.
-            Some(svg_source_result) => svg_source_result.ok(),
-        };
+        if svg_data.needs_serialization {
+            // The SVGSVGElement is not yet serialized (or its DOM subtree changed),
+            // so we add it to a list and hand it over to script to perform serialization
+            // while keeping any previous URL available for flicker-free display.
+            context
+                .image_resolver
+                .queue_svg_element_for_serialization(node);
+        }
+        let svg_source = svg_data.source.and_then(|svg_source_result| svg_source_result.ok());
 
         let cached_image = svg_source.and_then(|svg_source| {
             context
@@ -333,6 +331,7 @@ impl ReplacedContents {
             ReplacedContentKind::SVGElement {
                 vector_image,
                 has_viewbox: svg_data.view_box.is_some(),
+                svg_id: svg_data.svg_id,
             },
             natural_size,
         )
@@ -626,12 +625,11 @@ impl ReplacedContents {
             ReplacedContentKind::SVGElement {
                 vector_image,
                 has_viewbox,
+                svg_id,
             } => {
-                let Some(vector_image) = vector_image else {
-                    return vec![];
-                };
-
-                if !has_viewbox {
+                if let Some(vector_image) = vector_image &&
+                    !has_viewbox
+                {
                     base.set_rect(
                         PhysicalSize::new(
                             vector_image
@@ -657,14 +655,27 @@ impl ReplacedContents {
                 );
 
                 let tag = self.base_fragment_info.tag.unwrap();
-                layout_context
-                    .image_resolver
-                    .rasterize_vector_image(
-                        vector_image.id,
-                        raster_size,
-                        tag.node,
-                        vector_image.svg_id,
-                    )
+                let rasterized = if let Some(vector_image) = vector_image {
+                    layout_context
+                        .image_resolver
+                        .rasterize_vector_image(
+                            vector_image.id,
+                            raster_size,
+                            tag.node,
+                            vector_image.svg_id,
+                        )
+                        .or_else(|| {
+                            layout_context
+                                .image_resolver
+                                .get_last_rasterized_svg_image(&svg_id, raster_size)
+                        })
+                } else {
+                    layout_context
+                        .image_resolver
+                        .get_last_rasterized_svg_image(&svg_id, raster_size)
+                };
+
+                rasterized
                     .and_then(|image| image.id)
                     .map(|image_key| {
                         Fragment::Image(Arc::new(ImageFragment {

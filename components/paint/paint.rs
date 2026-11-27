@@ -23,7 +23,7 @@ use image::RgbaImage;
 use log::{debug, warn};
 use paint_api::rendering_context::RenderingContext;
 use paint_api::{
-    PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
+    ImageUpdate, PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
     WebRenderExternalImageIdManager, WebViewTrait,
 };
 use profile_traits::mem::{
@@ -31,7 +31,7 @@ use profile_traits::mem::{
 };
 use profile_traits::path;
 use profile_traits::time::{self as profile_time};
-use servo_base::generic_channel::{self, GenericSender, RoutedReceiver};
+use servo_base::generic_channel::{self, GenericCallback, GenericSender, RoutedReceiver};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
 #[cfg(feature = "webgl")]
 use servo_canvas_traits::webgl::{WebGLContextId, WebGLThreads};
@@ -191,6 +191,8 @@ bitflags! {
 
 impl Paint {
     pub fn new(state: InitialPaintState) -> Rc<RefCell<Self>> {
+        paint_api::enable_in_process_raw_image_budget();
+
         let registration = state.mem_profiler_chan.prepare_memory_reporting(
             "paint".into(),
             state.paint_proxy.clone(),
@@ -390,7 +392,19 @@ impl Paint {
     pub fn finish_shutting_down(&self) {
         // Drain paint port, sometimes messages contain channels that are blocking
         // another thread from finishing (i.e. SetFrameTree).
-        while self.paint_receiver.try_recv().is_ok() {}
+        while let Ok(msg) = self.paint_receiver.try_recv() {
+            match msg {
+                Ok(PaintMessage::UpdateImages(_, updates)) => {
+                    paint_api::release_raw_image_update_bytes(
+                        paint_api::count_raw_image_update_bytes(&updates),
+                    );
+                },
+                Ok(PaintMessage::UpdateVideoImages(_, updates, ack)) => {
+                    Self::release_and_ack_video_updates(&updates, ack);
+                },
+                _ => {},
+            }
+        }
 
         #[cfg(feature = "webgl")]
         self.webgl_paint.shutdown();
@@ -516,6 +530,11 @@ impl Paint {
                 self.handle_generate_image_keys_for_pipeline(webview_id, pipeline_id);
             },
             PaintMessage::UpdateImages(painter_id, updates) => {
+                if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
+                    painter.update_images(updates);
+                }
+            },
+            PaintMessage::UpdateVideoImages(painter_id, updates, _ack) => {
                 if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
                     painter.update_images(updates);
                 }
@@ -759,6 +778,19 @@ impl Paint {
         &self.paint_receiver
     }
 
+    fn release_and_ack_video_updates(
+        updates: &[ImageUpdate],
+        ack: Option<GenericCallback<usize>>,
+    ) {
+        let raw_bytes = paint_api::count_raw_image_update_bytes(updates);
+        paint_api::release_raw_image_update_bytes(raw_bytes);
+        if raw_bytes > 0 &&
+            let Some(ack) = ack
+        {
+            let _ = ack.send(raw_bytes);
+        }
+    }
+
     #[servo_tracing::instrument(skip_all)]
     pub fn handle_messages(&self, mut messages: Vec<PaintMessage>) {
         // Pull out the `NewWebRenderFrameReady` messages from the list of messages and handle them
@@ -779,6 +811,20 @@ impl Paint {
             },
             _ => true,
         });
+
+        for message in &mut messages {
+            match message {
+                PaintMessage::UpdateImages(_, updates) => {
+                    paint_api::release_raw_image_update_bytes(
+                        paint_api::count_raw_image_update_bytes(updates),
+                    );
+                },
+                PaintMessage::UpdateVideoImages(_, updates, ack) => {
+                    Self::release_and_ack_video_updates(updates, ack.take());
+                },
+                _ => {},
+            }
+        }
 
         for message in messages {
             self.handle_browser_message(message);
@@ -815,6 +861,16 @@ impl Paint {
         for painter in &self.painters {
             painter.borrow_mut().toggle_webrender_debug(option);
         }
+    }
+
+    pub fn notify_memory_pressure(&self) {
+        if self.shutdown_state() != ShutdownState::NotShuttingDown {
+            return;
+        }
+        for painter in &self.painters {
+            painter.borrow_mut().notify_memory_pressure();
+        }
+        servo_allocator::purge_unused_memory();
     }
 
     pub fn capture_webrender(&self, webview_id: WebViewId) {

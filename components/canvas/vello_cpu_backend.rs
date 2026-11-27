@@ -220,28 +220,64 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
         source: Rect<i32>,
         destination: Point2D<i32>,
     ) {
-        self.ensure_drawing();
-        let destination: kurbo::Point = destination.cast::<f64>().into();
-        let rect = kurbo::Rect::from_origin_size(destination, source.size.cast());
-        self.ctx.set_transform(kurbo::Affine::IDENTITY);
-        self.ignore_clips(|self_| {
-            // Clipped blending does not work correctly:
-            // https://github.com/linebender/vello/issues/1119
-            // self_.push_layer(Some(rect.to_path(0.1)), Some(peniko::Compose::Copy.into()), None, None);
+        let surface_size = Size2D::new(surface.width() as u32, surface.height() as u32);
+        let canvas_size = self.size();
+        if surface_size.is_empty() || canvas_size.is_empty() || source.is_empty() {
+            return;
+        }
 
-            self_.ctx.set_paint(vello_cpu::Image {
-                image: vello_cpu::ImageSource::Pixmap(surface),
-                sampler: peniko::ImageSampler {
-                    x_extend: peniko::Extend::Pad,
-                    y_extend: peniko::Extend::Pad,
-                    quality: peniko::ImageQuality::Low,
-                    alpha: 1.0,
+        let surface_bounds = Rect::from_size(surface_size.to_i32());
+        let Some(clipped_src) = source.intersection(&surface_bounds) else {
+            return;
+        };
+        let dst_offset = destination + (clipped_src.origin - source.origin);
+        let unclipped_dst = Rect::new(dst_offset, clipped_src.size);
+        let canvas_bounds = Rect::from_size(canvas_size.to_i32());
+        let Some(dst_rect) = unclipped_dst.intersection(&canvas_bounds) else {
+            return;
+        };
+        if dst_rect.is_empty() {
+            return;
+        }
+        let src_rect = Rect::new(
+            clipped_src.origin + (dst_rect.origin - unclipped_dst.origin),
+            dst_rect.size,
+        )
+        .to_u32();
+        let dst_rect = dst_rect.to_u32();
+
+        if dst_rect == Rect::from_size(canvas_size) && src_rect == Rect::from_size(surface_size) {
+            if self.state == State::Drawing {
+                self.ignore_clips(|self_| {
+                    self_.ctx.reset();
+                    self_.state = State::Rendered;
+                });
+            }
+            match Arc::try_unwrap(surface) {
+                Ok(pixmap) => {
+                    self.pixmap = pixmap;
                 },
-            });
-            self_.ctx.fill_rect(&rect);
+                Err(surface) => {
+                    self.pixmap
+                        .data_as_u8_slice_mut()
+                        .copy_from_slice(surface.data_as_u8_slice());
+                },
+            }
+            return;
+        }
 
-            // self_.ctx.pop_layer();
-        });
+        let _ = self.pixmap();
+        let src_bytes = surface.data_as_u8_slice();
+        let dst_bytes = self.pixmap.data_as_u8_slice_mut();
+        pixels::copy_rgba8_image(
+            surface_size,
+            src_rect,
+            src_bytes,
+            canvas_size,
+            dst_rect,
+            dst_bytes,
+        );
+        self.state = State::Rendered;
     }
 
     fn create_similar_draw_target(&self, size: &Size2D<i32>) -> Self {

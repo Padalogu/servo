@@ -618,19 +618,23 @@ fn create_cached_response(
     done_chan: &mut DoneChannel,
 ) -> Option<CachedResponse> {
     debug!("creating a cached response for {:?}", request.url());
-    if cached_resource.aborted.load(Ordering::Acquire) {
-        return None;
+    {
+        let mut awaiting_body = cached_resource.awaiting_body.lock();
+        let body = cached_resource.body.lock();
+        if cached_resource.aborted.load(Ordering::Acquire) {
+            return None;
+        }
+        if let ResponseBody::Receiving(_) = *body {
+            debug!("existing body is in progress");
+            let (done_sender, done_receiver) = unbounded();
+            *done_chan = Some((done_sender.clone(), done_receiver));
+            awaiting_body.push(done_sender);
+        }
     }
     let resource_timing = ResourceFetchTiming::new(request.timing_type());
     let mut response = Response::new(cached_resource.metadata.final_url.clone(), resource_timing);
     response.headers = cached_headers.clone();
     response.body = cached_resource.body.clone();
-    if let ResponseBody::Receiving(_) = *cached_resource.body.lock() {
-        debug!("existing body is in progress");
-        let (done_sender, done_receiver) = unbounded();
-        *done_chan = Some((done_sender.clone(), done_receiver));
-        cached_resource.awaiting_body.lock().push(done_sender);
-    }
     response
         .location_url
         .clone_from(&cached_resource.location_url);
@@ -942,16 +946,20 @@ pub fn refresh(
         // Otherwise, create a new dedicated channel to update the consumer.
         // The response constructed here will replace the 304 one from the network.
         let cached_resource = &mut cached_resources[cached_resource_index];
-        let in_progress_channel = match &*cached_resource.body.lock() {
-            ResponseBody::Receiving(..) => Some(unbounded()),
-            ResponseBody::Empty | ResponseBody::Done(..) => None,
-        };
-        match in_progress_channel {
-            Some((done_sender, done_receiver)) => {
-                *done_chan = Some((done_sender.clone(), done_receiver));
-                cached_resource.awaiting_body.lock().push(done_sender);
-            },
-            None => *done_chan = None,
+        {
+            let mut awaiting_body = cached_resource.awaiting_body.lock();
+            let body = cached_resource.body.lock();
+            if cached_resource.aborted.load(Ordering::Acquire) {
+                return None;
+            }
+            match &*body {
+                ResponseBody::Receiving(..) => {
+                    let (done_sender, done_receiver) = unbounded();
+                    *done_chan = Some((done_sender.clone(), done_receiver));
+                    awaiting_body.push(done_sender);
+                },
+                ResponseBody::Empty | ResponseBody::Done(..) => *done_chan = None,
+            }
         }
         // Received a response with 304 status code, in response to a request that matches a cached resource.
         // 1. update the headers of the cached resource.
@@ -1032,7 +1040,8 @@ impl HttpCache {
         let lock = cached_resources.read().await;
         let relevant_cached_resources = lock.iter().filter(|resource| {
             if actual_response.is_network_error() {
-                return *resource.body.lock() == ResponseBody::Empty;
+                return resource.aborted.load(Ordering::Acquire) ||
+                    *resource.body.lock() == ResponseBody::Empty;
             }
             resource.status == actual_response.status
         });

@@ -48,9 +48,11 @@ use style_traits::{CssWriter, ParsingMode, ToCss};
 use crate::css::css::parser_context_for_document;
 use crate::dom::Document;
 use crate::dom::animationeffect::AnimationEffect;
+use crate::dom::bindings::codegen::Bindings::AnimationEffectBinding::OptionalEffectTiming;
 use crate::dom::bindings::codegen::Bindings::KeyframeEffectBinding::{
     BaseComputedKeyframe, KeyframeEffectMethods,
 };
+use crate::dom::bindings::codegen::UnionTypes::UnrestrictedDoubleOrString;
 use crate::dom::bindings::root::MutNullableDom;
 use crate::dom::element::Element;
 use crate::dom::window::Window;
@@ -92,6 +94,10 @@ impl KeyframeEffect {
     pub(crate) fn new(cx: &mut JSContext, window: &Window) -> DomRoot<Self> {
         Self::new_with_proto(cx, window, None)
     }
+
+    pub(crate) fn target_element(&self) -> Option<DomRoot<Element>> {
+        self.target_element.get()
+    }
 }
 
 impl KeyframeEffectMethods<crate::DomTypeHolder> for KeyframeEffect {
@@ -102,7 +108,7 @@ impl KeyframeEffectMethods<crate::DomTypeHolder> for KeyframeEffect {
         _: Option<HandleObject>,
         target: Option<&Element>,
         keyframes: *mut JSObject,
-        _options: UnrestrictedDoubleOrKeyframeEffectOptions,
+        options: UnrestrictedDoubleOrKeyframeEffectOptions,
     ) -> DomRoot<KeyframeEffect> {
         // Step 1. Create a new KeyframeEffect object, effect.
         let effect = KeyframeEffect::new(cx, window);
@@ -113,11 +119,40 @@ impl KeyframeEffectMethods<crate::DomTypeHolder> for KeyframeEffect {
         // TODO: Step 3. Set the target pseudo-selector to the result corresponding to
         // the first matching condition below:
 
-        // TODO: Step 4. Let timing input be the result corresponding to the first matching
+        // Step 4. Let timing input be the result corresponding to the first matching
         // condition below:
+        let timing_input = match options {
+            UnrestrictedDoubleOrKeyframeEffectOptions::UnrestrictedDouble(duration) => {
+                OptionalEffectTiming {
+                    duration: Some(UnrestrictedDoubleOrString::UnrestrictedDouble(duration)),
+                    direction: None,
+                    easing: None,
+                    delay: None,
+                    endDelay: None,
+                    fill: None,
+                    iterationStart: None,
+                    iterations: None,
+                }
+            },
+            UnrestrictedDoubleOrKeyframeEffectOptions::KeyframeEffectOptions(opts) => {
+                OptionalEffectTiming {
+                    delay: Some(opts.parent.delay),
+                    direction: Some(opts.parent.direction),
+                    duration: Some(opts.parent.duration),
+                    easing: Some(opts.parent.easing),
+                    endDelay: Some(opts.parent.endDelay),
+                    fill: Some(opts.parent.fill),
+                    iterationStart: Some(opts.parent.iterationStart),
+                    iterations: Some(opts.parent.iterations),
+                }
+            },
+        };
 
         // Step 5. Call the procedure to update the timing properties of an animation effect of
         // effect from timing input.
+        let _ = effect
+            .upcast::<AnimationEffect>()
+            .update_the_timing_properties(&timing_input);
         // If that procedure causes an exception to be thrown, propagate the exception and abort this procedure.
 
         // TODO: Step 6. If options is a KeyframeEffectOptions object, assign the composite property of effect

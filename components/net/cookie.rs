@@ -208,6 +208,16 @@ impl ServoCookie {
             return None;
         }
 
+        // RFC 6265bis: Cookies with SameSite=None MUST also have the Secure attribute.
+        if cookie.same_site() == Some(cookie::SameSite::None) && !secure_only {
+            return None;
+        }
+
+        // CHIPS: Cookies with the Partitioned attribute MUST also have the Secure attribute.
+        if cookie.partitioned().unwrap_or(false) && !secure_only {
+            return None;
+        }
+
         // Step 14. If the cookie-attribute-list contains an attribute with an attribute-name of "HttpOnly",
         // set the cookie's http-only-flag to true. Otherwise, set the cookie's http-only-flag to false.
         let http_only = cookie.http_only().unwrap_or(false);

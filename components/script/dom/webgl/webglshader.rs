@@ -79,6 +79,7 @@ pub(crate) struct WebGLShader {
     webgl_object: WebGLObject,
     gl_type: u32,
     source: DomRefCell<TracedDOMString>,
+    translated_source: DomRefCell<TracedDOMString>,
     info_log: DomRefCell<TracedDOMString>,
     attached_counter: Cell<u32>,
     compilation_status: Cell<ShaderCompilationStatus>,
@@ -94,6 +95,7 @@ impl WebGLShader {
             webgl_object: WebGLObject::new_inherited(context),
             gl_type: shader_type,
             source: Default::default(),
+            translated_source: Default::default(),
             info_log: Default::default(),
             attached_counter: Cell::new(0),
             compilation_status: Cell::new(ShaderCompilationStatus::NotCompiled),
@@ -252,6 +254,8 @@ impl WebGLShader {
             Ok(()) => {
                 let translated_source = validator.object_code();
                 debug!("Shader translated: {}", translated_source);
+                *self.translated_source.borrow_mut() =
+                    DOMString::from(translated_source.as_str()).traced();
                 // NOTE: At this point we should be pretty sure that the compilation in the paint thread
                 // will succeed.
                 // It could be interesting to retrieve the info log from the paint thread though
@@ -261,6 +265,7 @@ impl WebGLShader {
                     .set(ShaderCompilationStatus::Succeeded);
             },
             Err(error) => {
+                *self.translated_source.borrow_mut() = Default::default();
                 self.compilation_status.set(ShaderCompilationStatus::Failed);
                 debug!("Shader {} compilation failed: {}", self.id(), error);
             },
@@ -307,6 +312,11 @@ impl WebGLShader {
     /// Get the shader source
     pub(crate) fn source(&self) -> DOMString {
         self.source.borrow().clone().root()
+    }
+
+    /// Get the translated shader source
+    pub(crate) fn translated_source(&self) -> DOMString {
+        self.translated_source.borrow().clone().root()
     }
 
     /// glShaderSource

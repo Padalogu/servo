@@ -75,6 +75,7 @@ mod clip;
 mod conversions;
 mod gradient;
 mod hit_test;
+mod mask;
 mod paint_timing_handler;
 mod paint_traversal;
 mod painted_region;
@@ -521,7 +522,8 @@ impl DisplayListBuilder<'_> {
                     effects.backdrop_filter.0.is_empty() &&
                     effects.opacity == 1.0 &&
                     effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
-                    style.get_svg().clip_path == ComputedClipPath::None
+                    style.get_svg().clip_path == ComputedClipPath::None &&
+                    !style.has_mask_image()
                 {
                     return false;
                 }
@@ -563,6 +565,24 @@ impl DisplayListBuilder<'_> {
             clip_id => Some(self.clip_chain_id(clip_id)),
         };
         let spatial_id = self.spatial_id(stacking_context.scroll_tree_node_id);
+        let clip_chain_id = if let StackingContextFragments::Fragment(fragment) =
+            &stacking_context.fragment
+        {
+            if fragment.style().has_mask_image() {
+                mask::build_mask_clip_chain(
+                    self,
+                    stacking_context,
+                    fragment,
+                    spatial_id,
+                    clip_chain_id,
+                )
+                .or(clip_chain_id)
+            } else {
+                clip_chain_id
+            }
+        } else {
+            clip_chain_id
+        };
 
         self.wr().push_stacking_context(
             spatial_id,

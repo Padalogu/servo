@@ -24,6 +24,9 @@ use stylo_atoms::Atom;
 
 use crate::conversions::Convert;
 use crate::css::stylesheet_set::StylesheetSetRef;
+use crate::dom::animation::Animation;
+use crate::dom::animationtimeline::AnimationTimeline;
+use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::GetHTMLOptions;
 use crate::dom::bindings::codegen::Bindings::HTMLSlotElementBinding::HTMLSlotElement_Binding::HTMLSlotElementMethods;
 use crate::dom::bindings::codegen::Bindings::SanitizerBinding::{
@@ -58,6 +61,7 @@ use crate::dom::node::{
     VecPreOrderInsertionHelper,
 };
 use crate::dom::sanitizer::Sanitizer;
+use crate::dom::selection::Selection;
 use crate::dom::trustedtypes::trustedhtml::TrustedHTML;
 use crate::dom::types::EventTarget;
 use crate::dom::window::Window;
@@ -624,6 +628,20 @@ impl ShadowRootMethods<crate::DomTypeHolder> for ShadowRoot {
             self.upcast::<Node>(),
             self.document.fullscreen_element(),
         )
+    }
+
+    /// <https://drafts.csswg.org/web-animations-1/#dom-documentorshadowroot-getanimations>
+    fn GetAnimations(&self) -> Vec<DomRoot<Animation>> {
+        self.document
+            .Timeline()
+            .upcast::<AnimationTimeline>()
+            .animations_for_shadow_root(self)
+    }
+
+    /// <https://w3c.github.io/selection-api/#dom-documentorshadowroot-getselection>
+    fn GetSelection(&self, cx: &mut JSContext) -> Option<DomRoot<Selection>> {
+        self.document_or_shadow_root
+            .get_selection(cx, &self.document)
     }
 }
 

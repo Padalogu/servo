@@ -42,6 +42,7 @@ use crate::dom::document::RefreshRedirectDue;
 use crate::dom::eventsource::EventSourceTimeoutCallback;
 use crate::dom::geolocation::geolocation::GeolocationTimeoutCallback;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::window::idledeadline::IdleCallbackTimeoutCallback;
 #[cfg(feature = "testbinding")]
 use crate::dom::testbinding::TestBindingCallback;
 use crate::dom::trustedtypes::trustedscript::TrustedScript;
@@ -210,6 +211,8 @@ pub(crate) enum OneshotTimerCallback {
     EventSourceTimeout(EventSourceTimeoutCallback),
     /// <https://www.w3.org/TR/geolocation/#dom-positionoptions-timeout>
     GeolocationTimeout(GeolocationTimeoutCallback),
+    /// <https://w3c.github.io/requestidlecallback/>
+    IdleCallbackTimeout(IdleCallbackTimeoutCallback),
     #[cfg(feature = "testbinding")]
     TestBindingCallback(TestBindingCallback),
     RefreshRedirectDue(RefreshRedirectDue),
@@ -234,6 +237,7 @@ impl OneshotTimerCallback {
             OneshotTimerCallback::XhrTimeout(callback) => callback.invoke(cx),
             OneshotTimerCallback::EventSourceTimeout(callback) => callback.invoke(),
             OneshotTimerCallback::GeolocationTimeout(callback) => callback.invoke(),
+            OneshotTimerCallback::IdleCallbackTimeout(callback) => callback.invoke(cx),
             #[cfg(feature = "testbinding")]
             OneshotTimerCallback::TestBindingCallback(callback) => callback.invoke(cx),
             OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(cx, global),

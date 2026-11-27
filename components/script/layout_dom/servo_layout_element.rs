@@ -142,6 +142,30 @@ impl<'dom> LayoutElement<'dom> for ServoLayoutElement<'dom> {
         }
     }
 
+    fn has_dirty_layout_descendants(&self) -> bool {
+        unsafe {
+            self.as_node()
+                .node
+                .get_flag(NodeFlags::HAS_DIRTY_LAYOUT_DESCENDANTS)
+        }
+    }
+
+    fn set_has_dirty_layout_descendants(&self) {
+        unsafe {
+            self.as_node()
+                .node
+                .set_flag(NodeFlags::HAS_DIRTY_LAYOUT_DESCENDANTS, true);
+        }
+    }
+
+    fn unset_has_dirty_layout_descendants(&self) {
+        unsafe {
+            self.as_node()
+                .node
+                .set_flag(NodeFlags::HAS_DIRTY_LAYOUT_DESCENDANTS, false);
+        }
+    }
+
     fn style_data(self) -> Option<&'dom StyleData> {
         self.element.style_data()
     }

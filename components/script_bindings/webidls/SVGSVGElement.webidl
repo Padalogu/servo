@@ -27,8 +27,8 @@ interface SVGSVGElement : SVGGraphicsElement {
   //DOMPoint createSVGPoint();
   //DOMMatrix createSVGMatrix();
   //DOMRect createSVGRect();
-  //SVGTransform createSVGTransform();
-  //SVGTransform createSVGTransformFromMatrix(DOMMatrixReadOnly matrix);
+  SVGTransform createSVGTransform();
+  [Throws] SVGTransform createSVGTransformFromMatrix(optional DOMMatrix2DInit matrix = {});
 
   //Element getElementById(DOMString elementId);
 

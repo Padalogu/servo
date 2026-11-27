@@ -29,7 +29,9 @@ use crate::geom::{
     PhysicalSize, PhysicalVec, ToLogical, ToLogicalWithContainingBlock,
 };
 use crate::layout_box_base::{IndependentFormattingContextLayoutResult, LayoutBoxBase};
-use crate::sizing::{LazySize, Size, SizeConstraint, Sizes};
+use crate::sizing::{
+    LazySize, NonReplacedAspectRatioBlockSize, Size, SizeConstraint, Sizes,
+};
 use crate::style_ext::{Clamp, ComputedValuesExt, ContentBoxSizesAndPBM, DisplayInside};
 use crate::{
     ConstraintSpace, ContainingBlock, ContainingBlockSize, DefiniteContainingBlock,
@@ -670,17 +672,32 @@ impl IndependentFormattingContext {
             is_table,
         );
 
+        let aspect_ratio_block_size = (!is_table_or_replaced)
+            .then(|| {
+                NonReplacedAspectRatioBlockSize::from_style(
+                    &style,
+                    preferred_aspect_ratio,
+                    &block_axis_solver.computed_sizes,
+                    block_stretch_size,
+                    tentative_block_size,
+                    inline_size,
+                )
+            })
+            .flatten();
+
         let containing_block_for_children = ContainingBlock {
             size: ContainingBlockSize {
                 inline: inline_size,
-                block: tentative_block_size,
+                block: aspect_ratio_block_size.map_or(tentative_block_size, |ar| {
+                    SizeConstraint::Definite(ar.clamped_ratio_block_size)
+                }),
             },
             style: &style,
         };
         // TODO: https://drafts.csswg.org/css-writing-modes/#orthogonal-flows
 
         let mut positioning_context = PositioningContext::default();
-        let lazy_block_size = LazySize::new(
+        let mut lazy_block_size = LazySize::new(
             &block_axis_solver.computed_sizes,
             LogicalAxis::Block,
             block_automatic_size,
@@ -688,6 +705,9 @@ impl IndependentFormattingContext {
             block_stretch_size,
             is_table,
         );
+        if let Some(ar) = aspect_ratio_block_size {
+            lazy_block_size.set_aspect_ratio(ar);
+        }
 
         let containing_block = &containing_block.into();
         let (layout, is_cached) = self.layout_and_is_cached(

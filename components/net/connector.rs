@@ -672,6 +672,11 @@ pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
         .timer(TokioTimer::new())
         // This is necessary for hyper to reap unused idle keep-alive connections.
         .pool_timer(TokioTimer::new())
+        .http2_max_header_list_size(256 * 1024)
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .http2_keep_alive_timeout(Duration::from_secs(20))
+        .http2_keep_alive_while_idle(true)
         // Other browsers control the maximum connections per host, tyipcally set to 6, but hyper
         // does not allow controlling this directly. Until we have code to manually do that, this
         // limit controls the maximum idle connections per host, which we still don't want to grow

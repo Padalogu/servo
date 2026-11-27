@@ -345,6 +345,7 @@ pub(crate) trait ComputedValuesExt {
     fn is_transformable(&self, fragment_flags: FragmentFlags) -> bool;
     fn has_transform_or_perspective_style(&self) -> bool;
     fn has_transform_style(&self) -> bool;
+    fn has_mask_image(&self) -> bool;
     fn has_effective_transform(&self, fragment_flags: FragmentFlags) -> bool;
     fn has_effective_transform_or_perspective(&self, fragment_flags: FragmentFlags) -> bool;
     fn z_index_applies(&self, fragment_flags: FragmentFlags) -> bool;
@@ -687,6 +688,14 @@ impl ComputedValuesExt for ComputedValues {
         overflow
     }
 
+    fn has_mask_image(&self) -> bool {
+        self.get_svg()
+            .mask_image
+            .0
+            .iter()
+            .any(|image| !matches!(image, ComputedImageLayer::None))
+    }
+
     /// Get the used `transform-style` value according to the the rules in
     /// <https://drafts.csswg.org/css-transforms/#grouping-property-values>.
     fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle {
@@ -712,7 +721,7 @@ impl ComputedValuesExt for ComputedValues {
         //    used value of the contain property, such as content-visibility:
         //    hidden.
         //
-        // TODO: Support `mask-image`, `mask-border-source`, and `contain`.
+        // TODO: Support `mask-border-source`, and `contain`.
         let effects = self.get_effects();
         let overflow = self.effective_overflow(fragment_flags);
         if !matches!(overflow.x, Overflow::Visible | Overflow::Clip) ||
@@ -721,6 +730,7 @@ impl ComputedValuesExt for ComputedValues {
             !effects.filter.0.is_empty() ||
             !effects.clip.is_auto() ||
             self.get_svg().clip_path != ClipPath::None ||
+            self.has_mask_image() ||
             self.get_box().isolation == ComputedIsolation::Isolate ||
             effects.mix_blend_mode != ComputedMixBlendMode::Normal
         {
@@ -873,6 +883,12 @@ impl ComputedValuesExt for ComputedValues {
         // > A computed value of other than `none` results in the creation of a stacking context.
         // Note `will-change: clip-path` is handled above by `STACKING_CONTEXT_UNCONDITIONAL`.
         if self.get_svg().clip_path != ClipPath::None {
+            return true;
+        }
+
+        // From <https://drafts.fxtf.org/css-masking-1/#the-mask-image>
+        // > A computed value of other than `none` results in the creation of a stacking context.
+        if self.has_mask_image() {
             return true;
         }
 

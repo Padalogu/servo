@@ -311,6 +311,7 @@ class Descriptor(DescriptorProvider):
         self.bindingPath = f"{getModuleFromObject(self.interface)}::{ifaceName}_Binding"
         self.outerObjectHook = desc.get('outerObjectHook', 'None')
         self.proxy = False
+        self.emulatesUndefined = desc.get('emulatesUndefined', False)
         self.weakReferenceable = desc.get('weakReferenceable', False)
         self.useSystemCompartment = desc.get('useSystemCompartment', False)
         self.allowDropImpl = desc.get('allowDropImpl', False)
@@ -334,6 +335,7 @@ class Descriptor(DescriptorProvider):
             'NamedSetter': None,
             'NamedDeleter': None,
             'Stringifier': None,
+            'LegacyCaller': None,
         }
 
         self.hasDefaultToJSON = False
@@ -373,6 +375,10 @@ class Descriptor(DescriptorProvider):
                         addIndexedOrNamedOperation('Setter', m)
                     if m.isDeleter():
                         addIndexedOrNamedOperation('Deleter', m)
+                    if m.isLegacycaller():
+                        if not self.isGlobal():
+                            self.proxy = True
+                        addOperation('LegacyCaller', m)
 
                 iface = iface.parent
                 if iface:

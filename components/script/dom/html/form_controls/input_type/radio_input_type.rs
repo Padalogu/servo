@@ -19,7 +19,6 @@ use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::form_controls::htmlinputelement::{HTMLInputElement, InputActivationState};
-use crate::dom::html::form_controls::input_type::text_value_widget::TextValueWidget;
 use crate::dom::html::form_controls::input_type::{
     InputType, SpecificInputActivationType, SpecificInputType, ValueChangeEvents,
 };
@@ -27,14 +26,10 @@ use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
 use crate::dom::input_type::text_input_widget::TextInputWidget;
 use crate::dom::iterators::ShadowIncluding;
 use crate::dom::node::{Node, UnbindContext};
-use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 
 #[derive(Default, JSTraceable, MallocSizeOf, PartialEq)]
-#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
-pub(crate) struct RadioInputType {
-    text_value_widget: DomRefCell<TextValueWidget>,
-}
+pub(crate) struct RadioInputType();
 
 #[derive(Clone, Copy)]
 pub(crate) struct RadioInputActivation;
@@ -129,9 +124,9 @@ impl SpecificInputType for RadioInputType {
     }
 
     fn update_shadow_tree(&self, cx: &mut JSContext, input: &HTMLInputElement) {
-        self.text_value_widget
-            .borrow()
-            .update_shadow_tree(cx, input)
+        if let Some(shadow_root) = input.upcast::<Element>().shadow_root() {
+            Node::replace_all(cx, None, shadow_root.upcast());
+        }
     }
 
     fn attribute_mutated(
@@ -173,8 +168,7 @@ impl SpecificInputType for RadioInputType {
             form_owner.as_deref(),
             &root,
         ) {
-            r.validity_state(cx)
-                .perform_validation_and_update(cx, ValidationFlags::all());
+            r.update_validity_state(cx, ValidationFlags::all());
         }
     }
 
@@ -251,8 +245,7 @@ pub(crate) fn perform_radio_group_validation(
         .GetRootNode(&GetRootNodeOptions::empty());
     let form = elem.form_owner();
     for r in radio_group_iter(elem, group, form.as_deref(), &root) {
-        r.validity_state(cx)
-            .perform_validation_and_update(cx, ValidationFlags::all());
+        r.update_validity_state(cx, ValidationFlags::all());
     }
 }
 

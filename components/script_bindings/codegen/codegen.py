@@ -3456,7 +3456,10 @@ class CGWrapMethod(CGAbstractMethod):
         prototype_id = f"PrototypeList::ID::{self.descriptor.name}"
         proto_object_fn = "GetProtoObject::<D>"
         if self.descriptor.proxy:
-            c = "None"
+            if self.descriptor.emulatesUndefined:
+                c = "Some(&ProxyObjectClass)"
+            else:
+                c = "None"
         else:
             c = "Some(&Class.get().base)"
 
@@ -4221,6 +4224,9 @@ class CGDefineProxyHandler(CGAbstractMethod):
            self.descriptor.isMaybeCrossOriginObject():
             getOwnEnumerablePropertyKeys = "getOwnEnumerablePropertyKeys::<D>"
 
+        customCall = 'Some(call::<D>)' if self.descriptor.operations['LegacyCaller'] else 'None'
+        customIsCallable = 'Some(isCallable)' if self.descriptor.operations['LegacyCaller'] else 'None'
+
         return CGGeneric(f"""
 init_proxy_handler_dom_class::<D>();
 
@@ -4240,7 +4246,7 @@ let traps = ProxyTraps {{
     has: None,
     get: Some(get::<D>),
     set: {customSet},
-    call: None,
+    call: {customCall},
     construct: None,
     hasOwn: Some(hasOwn::<D>),
     getOwnEnumerablePropertyKeys: Some({getOwnEnumerablePropertyKeys}),
@@ -4253,7 +4259,7 @@ let traps = ProxyTraps {{
     trace: Some({TRACE_HOOK_NAME}::<D>),
     finalize: Some({FINALIZE_HOOK_NAME}::<D>),
     objectMoved: None,
-    isCallable: None,
+    isCallable: {customIsCallable},
     isConstructor: None,
 }};
 
@@ -7255,6 +7261,42 @@ class CGDOMJSProxyHandler_className(CGAbstractExternMethod):
         return CGGeneric(self.getBody())
 
 
+class CGDOMJSProxyHandler_call(CGAbstractExternMethod):
+    def __init__(self, descriptor: Descriptor) -> None:
+        args = [Argument('*mut RawJSContext', 'cx'), Argument('RawHandleObject', 'proxy'),
+                Argument('*const CallArgs', 'args')]
+        CGAbstractExternMethod.__init__(self, descriptor, "call", "bool", args, templateArgs=['D: DomTypes'])
+        self.descriptor = descriptor
+
+    def getBody(self) -> str:
+        legacyCaller = self.descriptor.operations['LegacyCaller']
+        assert legacyCaller is not None
+        cgCall = CGMethodCall([], "LegacyCaller", False, self.descriptor, legacyCaller)
+        return dedent("""\
+            let mut cx = JSContext::from_ptr(ptr::NonNull::new(cx).unwrap());
+            let mut cx = CurrentRealm::assert(&mut cx);
+            let cx = &mut cx;
+
+            let proxy = Handle::from_raw(proxy);
+            let this = UnwrapProxy::<D>(proxy.into());
+            let this = &*this;
+            let args = &*args;
+            let argc = args.argc_;
+            """) + cgCall.define()
+
+    def definition_body(self) -> CGThing:
+        return CGGeneric(self.getBody())
+
+
+class CGDOMJSProxyHandler_isCallable(CGAbstractExternMethod):
+    def __init__(self, descriptor: Descriptor) -> None:
+        args = [Argument('*mut JSObject', '_obj')]
+        CGAbstractExternMethod.__init__(self, descriptor, "isCallable", "bool", args, doesNotPanic=True)
+
+    def definition_body(self) -> CGThing:
+        return CGGeneric("true")
+
+
 class CGAbstractClassHook(CGAbstractExternMethod):
     """
     Meant for implementing JSClass hooks, like Finalize or Trace. Does very raw
@@ -7410,9 +7452,25 @@ class CGDOMJSProxyHandlerDOMClass(CGThing):
         self.descriptor = descriptor
 
     def define(self) -> str:
+        proxyObjectClass = ""
+        if self.descriptor.emulatesUndefined:
+            proxyObjectClass = """
+static ProxyObjectClass: JSClass = JSClass {
+    name: c"Proxy".as_ptr(),
+    flags: js::jsapi::JSClass_NON_NATIVE |
+        js::JSCLASS_IS_PROXY |
+        js::jsapi::JSCLASS_DELAY_METADATA_BUILDER |
+        js::jsapi::JSCLASS_EMULATES_UNDEFINED |
+        ((2 & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT),
+    cOps: unsafe { &js::jsapi::js::ProxyClassOps },
+    spec: ptr::null(),
+    ext: unsafe { &js::jsapi::js::ProxyClassExtension },
+    oOps: unsafe { &js::jsapi::js::ProxyObjectOps },
+};
+"""
         return f"""
 pub static Class: ThreadUnsafeOnceLock<DOMClass> = ThreadUnsafeOnceLock::new();
-
+{proxyObjectClass}
 pub(crate) fn init_proxy_handler_dom_class<D: DomTypes>() {{
     Class.set({DOMClass(self.descriptor)});
 }}
@@ -7883,6 +7941,10 @@ class CGDescriptor(CGThing):
 
                 if descriptor.isMaybeCrossOriginObject():
                     cgThings.append(CGDOMJSProxyHandler_getPrototype(descriptor))
+
+                if descriptor.operations['LegacyCaller']:
+                    cgThings.append(CGDOMJSProxyHandler_call(descriptor))
+                    cgThings.append(CGDOMJSProxyHandler_isCallable(descriptor))
 
                 # cgThings.append(CGDOMJSProxyHandler(descriptor))
                 # cgThings.append(CGIsMethod(descriptor))

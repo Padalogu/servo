@@ -87,3 +87,11 @@ interface mixin NavigatorContentUtils {
   [Throws, SecureContext, Pref="dom_navigator_protocol_handlers_enabled"] undefined registerProtocolHandler(DOMString scheme, USVString url);
   [Throws, SecureContext, Pref="dom_navigator_protocol_handlers_enabled"] undefined unregisterProtocolHandler(DOMString scheme, USVString url);
 };
+
+// https://w3c.github.io/encrypted-media/#navigator-extension:-requestmediakeysystemaccess()
+partial interface Navigator {
+  [SecureContext] Promise<MediaKeySystemAccess> requestMediaKeySystemAccess(
+    DOMString keySystem,
+    sequence<MediaKeySystemConfiguration> supportedConfigurations
+  );
+};

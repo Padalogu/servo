@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::default::Default;
 
 use dom_struct::dom_struct;
-use html5ever::{LocalName, Prefix, local_name};
+use html5ever::{LocalName, Prefix, local_name, ns};
 use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
@@ -28,11 +28,12 @@ use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlelement::{HTMLElement, PopoverState};
 use crate::dom::html::htmlformelement::{
     FormControl, FormDatum, FormDatumValue, FormSubmitterElement, HTMLFormElement, ResetFrom,
     SubmittedFrom,
 };
+use crate::dom::iterators::ShadowIncluding;
 use crate::dom::node::virtualmethods::{VirtualMethods, vtable_for};
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
@@ -53,6 +54,7 @@ pub(crate) struct HTMLButtonElement {
     form_owner: MutNullableDom<HTMLFormElement>,
     labels_node_list: MutNullableDom<NodeList>,
     validity_state: MutNullableDom<ValidityState>,
+    explicit_popover_target_element: MutNullableDom<Element>,
 }
 
 impl HTMLButtonElement {
@@ -72,6 +74,7 @@ impl HTMLButtonElement {
             form_owner: Default::default(),
             labels_node_list: Default::default(),
             validity_state: Default::default(),
+            explicit_popover_target_element: Default::default(),
         }
     }
 
@@ -113,11 +116,56 @@ impl HTMLButtonElementMethods<crate::DomTypeHolder> for HTMLButtonElement {
             CommandState::Close => DOMString::from_static("close"),
             CommandState::ShowModal => DOMString::from_static("show-modal"),
             CommandState::RequestClose => DOMString::from_static("request-close"),
+            CommandState::TogglePopover => DOMString::from_static("toggle-popover"),
+            CommandState::ShowPopover => DOMString::from_static("show-popover"),
+            CommandState::HidePopover => DOMString::from_static("hide-popover"),
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-button-command
     make_setter!(SetCommand, "command");
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetelement>
+    fn GetPopoverTargetElement(&self, cx: &mut JSContext) -> Option<DomRoot<Element>> {
+        self.popover_target_element(cx)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetelement>
+    fn SetPopoverTargetElement(&self, cx: &mut JSContext, value: Option<&Element>) {
+        let attr_name = LocalName::from("popovertarget");
+        match value {
+            Some(target) => {
+                self.upcast::<Element>()
+                    .set_string_attribute(cx, &attr_name, DOMString::new());
+                self.explicit_popover_target_element.set(Some(target));
+            },
+            None => {
+                self.explicit_popover_target_element.set(None);
+                self.upcast::<Element>()
+                    .remove_attribute(cx, &ns!(), &attr_name);
+            },
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetaction>
+    fn PopoverTargetAction(&self) -> DOMString {
+        let action = self
+            .upcast::<Element>()
+            .get_string_attribute(&LocalName::from("popovertargetaction"));
+        if action.eq_ignore_ascii_case("show") {
+            DOMString::from_static("show")
+        } else if action.eq_ignore_ascii_case("hide") {
+            DOMString::from_static("hide")
+        } else {
+            DOMString::from_static("toggle")
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-popovertargetaction>
+    fn SetPopoverTargetAction(&self, cx: &mut JSContext, value: DOMString) {
+        self.upcast::<Element>()
+            .set_string_attribute(cx, &LocalName::from("popovertargetaction"), value);
+    }
 
     // https://html.spec.whatwg.org/multipage/#dom-fe-disabled
     make_bool_getter!(Disabled, "disabled");
@@ -282,10 +330,10 @@ impl HTMLButtonElement {
             .perform_validation_and_update(cx, ValidationFlags::all());
     }
 
-    fn command_for_element(&self, cx: &mut JSContext) -> Option<DomRoot<Element>> {
-        let command_for_value = self
+    fn resolve_id_target(&self, cx: &mut JSContext, attr_name: &LocalName) -> Option<DomRoot<Element>> {
+        let target_id = self
             .upcast::<Element>()
-            .get_attribute_string_value(&local_name!("commandfor"))?
+            .get_attribute_string_value(attr_name)?
             .into();
 
         let root_node = self
@@ -293,11 +341,66 @@ impl HTMLButtonElement {
             .GetRootNode(&GetRootNodeOptions::empty());
 
         if let Some(document) = root_node.downcast::<Document>() {
-            return document.GetElementById(cx, command_for_value);
+            document.GetElementById(cx, target_id)
         } else if let Some(document_fragment) = root_node.downcast::<DocumentFragment>() {
-            return document_fragment.GetElementById(cx, command_for_value);
+            document_fragment.GetElementById(cx, target_id)
+        } else {
+            None
         }
-        unreachable!("Button element must be in a document or document fragment");
+    }
+
+    fn command_for_element(&self, cx: &mut JSContext) -> Option<DomRoot<Element>> {
+        self.resolve_id_target(cx, &local_name!("commandfor"))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#popover-target-element>
+    pub(crate) fn popover_target_element(&self, cx: &mut JSContext) -> Option<DomRoot<Element>> {
+        let attr_name = LocalName::from("popovertarget");
+        if !self.upcast::<Element>().has_attribute(&attr_name) {
+            return None;
+        }
+        if let Some(explicit) = self.explicit_popover_target_element.get() {
+            let explicit_root = explicit
+                .upcast::<Node>()
+                .GetRootNode(&GetRootNodeOptions::empty());
+            if self
+                .upcast::<Node>()
+                .inclusive_ancestors(ShadowIncluding::Yes)
+                .any(|ancestor| &*ancestor == &*explicit_root)
+            {
+                return Some(explicit);
+            }
+            return None;
+        }
+        self.resolve_id_target(cx, &attr_name)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#popover-target-attribute-activation-behavior>
+    fn popover_target_attribute_activation_behavior(&self, cx: &mut JSContext) {
+        let Some(popover_el) = self.popover_target_element(cx) else {
+            return;
+        };
+        let Some(popover) = popover_el.downcast::<HTMLElement>() else {
+            return;
+        };
+        if popover.popover_state() == PopoverState::None {
+            return;
+        }
+
+        let action = self.PopoverTargetAction();
+        if &*action == "show" {
+            if !popover.is_popover_open() {
+                let _ = popover.show_popover(cx, Some(self.upcast()), false);
+            }
+        } else if &*action == "hide" {
+            if popover.is_popover_open() {
+                let _ = popover.hide_popover(cx, true, true, false);
+            }
+        } else if popover.is_popover_open() {
+            let _ = popover.hide_popover(cx, true, true, false);
+        } else {
+            let _ = popover.show_popover(cx, Some(self.upcast()), false);
+        }
     }
 
     fn command_state(&self) -> CommandState {
@@ -315,6 +418,15 @@ impl HTMLButtonElement {
         }
         if command.eq_ignore_ascii_case("show-modal") {
             return CommandState::ShowModal;
+        }
+        if command.eq_ignore_ascii_case("toggle-popover") {
+            return CommandState::TogglePopover;
+        }
+        if command.eq_ignore_ascii_case("show-popover") {
+            return CommandState::ShowPopover;
+        }
+        if command.eq_ignore_ascii_case("hide-popover") {
+            return CommandState::HidePopover;
         }
 
         CommandState::Unknown
@@ -334,11 +446,17 @@ impl HTMLButtonElement {
         if !target.is_html_element() {
             return false;
         }
-        // TODO Step 4. If command is in any of the following states:
+        // Step 4. If command is in any of the following states:
         // - Toggle Popover
         // - Show Popover
         // - Hide Popover
         // then return true.
+        if matches!(
+            command,
+            CommandState::TogglePopover | CommandState::ShowPopover | CommandState::HidePopover
+        ) {
+            return true;
+        }
         // Step 5. If this standard does not define is valid command steps for target's local name, then return false.
         // Step 6. Otherwise, return the result of running target's corresponding is valid command steps given command.
         vtable_for(target.upcast::<Node>()).is_valid_command_steps(command)
@@ -388,6 +506,9 @@ impl VirtualMethods for HTMLButtonElement {
                 self.form_attribute_mutated(cx, mutation);
                 self.validity_state(cx)
                     .perform_validation_and_update(cx, ValidationFlags::empty());
+            },
+            ref name if *attr.namespace() == ns!() && &**name == "popovertarget" => {
+                self.explicit_popover_target_element.set(None);
             },
             _ => {},
         }
@@ -534,9 +655,11 @@ impl Activatable for HTMLButtonElement {
             // Step 5.10 Otherwise, if this standard defines command steps for target's local name,
             // then run the corresponding command steps given target, element, and command.
             let _ = vtable_for(target_node).command_steps(cx, DomRoot::from_ref(self), command);
+        } else {
+            // Step 6 Otherwise, run the popover target attribute activation behavior given element
+            // and event's target.
+            self.popover_target_attribute_activation_behavior(cx);
         }
-        // TODO Step 6 Otherwise, run the popover target attribute activation behavior given element
-        // and event's target.
     }
 }
 
@@ -547,4 +670,7 @@ pub(crate) enum CommandState {
     ShowModal,
     RequestClose,
     Close,
+    TogglePopover,
+    ShowPopover,
+    HidePopover,
 }

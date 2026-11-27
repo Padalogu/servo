@@ -594,6 +594,7 @@ impl HTMLImageElement {
                     LoadBlocker::terminate(cx, &pending_request.blocker);
                 }
                 self.pending_request.safe_borrow_mut(cx.no_gc()).take();
+                self.image_request.set(ImageRequestPhase::Current);
             },
         };
 
@@ -1080,8 +1081,13 @@ impl HTMLImageElement {
         };
 
         match cache_result {
-            ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable { .. }) => {
-                self.finish_reacting_to_environment_change(
+            ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
+                image,
+                url,
+            }) => {
+                self.process_image_response_for_environment_change(
+                    cx,
+                    ImageResponse::Loaded(image, url),
                     selected_source,
                     generation,
                     selected_pixel_density,
@@ -1234,12 +1240,11 @@ impl HTMLImageElement {
                     return;
                 }
 
-                // Step 16.2. Set the img element's last selected source to selected source and the
-                // img element's current pixel density to selected pixel density.
-                *this.last_selected_source.safe_borrow_mut(cx.no_gc()) = Some(selected_source);
-
-
                 if let Some(pending_request) = &mut *this.pending_request.safe_borrow_mut(cx.no_gc()) {
+                    // Step 16.2. Set the img element's last selected source to selected source and the
+                    // img element's current pixel density to selected pixel density.
+                    *this.last_selected_source.safe_borrow_mut(cx.no_gc()) = Some(selected_source);
+
                     // Step 16.3. Set the image request's state to completely available.
                     pending_request.state = State::CompletelyAvailable;
 
@@ -1250,11 +1255,13 @@ impl HTMLImageElement {
                     // Already a part of the list of available images due to Step 15.
                     // Step 16.5. Upgrade the pending request to the current request.
                 } else {
-                    log::error!("Pending request was null");
-                    return
+                    this.image_request.set(ImageRequestPhase::Current);
+                    debug!("Pending request was null");
+                    return;
                 }
+                LoadBlocker::terminate(cx, &this.current_request.borrow().blocker);
                 *this.current_request.safe_borrow_mut(cx.no_gc()) = this.pending_request.safe_borrow_mut(cx.no_gc()).take().expect("Should have a pending request");
-
+                LoadBlocker::terminate(cx, &this.current_request.borrow().blocker);
 
                 this.abort_request(cx, State::Unavailable, ImageRequestPhase::Pending);
                 this.image_request.set(ImageRequestPhase::Current);

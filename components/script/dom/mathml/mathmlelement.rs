@@ -6,8 +6,6 @@ use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
 use js::context::JSContext;
 use js::rust::HandleObject;
-use script_bindings::codegen::GenericBindings::ElementBinding::ScrollLogicalPosition;
-use script_bindings::codegen::GenericBindings::WindowBinding::ScrollBehavior;
 use script_bindings::str::DOMString;
 use style::parser::ParserContext;
 use style::properties::{PropertyDeclaration, longhands};
@@ -19,19 +17,20 @@ use stylo_dom::ElementState;
 use crate::dom::bindings::codegen::Bindings::HTMLOrSVGOrMathMLElementBinding::FocusOptions;
 use crate::dom::bindings::codegen::Bindings::MathMLElementBinding::MathMLElementMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::root::{DomRoot, LayoutDom};
+use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::document::Document;
 use crate::dom::document::focus::FocusableArea;
+use crate::dom::domstringmap::DOMStringMap;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
-use crate::dom::node::focus::FocusTrigger;
+use crate::dom::node::focus::{FocusOutcome, FocusTrigger};
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{Node, NodeTraits};
-use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollRequirement};
 
 #[dom_struct]
 pub(crate) struct MathMLElement {
     element: Element,
+    dataset: MutNullableDom<DOMStringMap>,
 }
 
 /// <https://w3c.github.io/mathml-core/#dom-mathmlelement>
@@ -49,6 +48,7 @@ impl MathMLElement {
                 prefix,
                 document,
             ),
+            dataset: Default::default(),
         }
     }
 
@@ -237,6 +237,12 @@ impl<'dom> LayoutDom<'dom, MathMLElement> {
 impl MathMLElementMethods<crate::DomTypeHolder> for MathMLElement {
     global_event_handlers!();
 
+    /// <https://html.spec.whatwg.org/multipage/#dom-dataset>
+    fn Dataset(&self, cx: &mut JSContext) -> DomRoot<DOMStringMap> {
+        self.dataset
+            .or_init(|| DOMStringMap::new(cx, self.as_element()))
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-noncedelement-nonce>
     fn Nonce(&self) -> DOMString {
         self.as_element().nonce_value().into()
@@ -256,26 +262,19 @@ impl MathMLElementMethods<crate::DomTypeHolder> for MathMLElement {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-focus>
     fn Focus(&self, cx: &mut JSContext, options: &FocusOptions) {
-        if !self
-            .upcast::<Node>()
-            .run_the_focusing_steps(cx, None, FocusTrigger::Script)
-        {
+        let outcome = self.upcast::<Node>().run_the_focusing_steps_with_outcome(
+            cx,
+            None,
+            FocusTrigger::Script,
+        );
+        if outcome == FocusOutcome::NotFocusable {
             return;
         }
 
         if !options.preventScroll {
-            let scroll_axis = ScrollAxisState {
-                position: ScrollLogicalPosition::Center,
-                requirement: ScrollRequirement::IfNotVisible,
-            };
-            self.upcast::<Element>().scroll_into_view_with_options(
-                cx,
-                ScrollBehavior::Smooth,
-                scroll_axis,
-                scroll_axis,
-                None,
-                None,
-            );
+            self.owner_document()
+                .focus_handler()
+                .scroll_element_into_view_if_needed(cx, self.upcast::<Element>(), outcome);
         }
     }
 

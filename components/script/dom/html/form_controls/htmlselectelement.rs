@@ -31,7 +31,7 @@ use crate::dom::bindings::codegen::GenericBindings::HTMLOptGroupElementBinding::
 use crate::dom::bindings::codegen::UnionTypes::{
     HTMLElementOrLong, HTMLOptionElementOrHTMLOptGroupElement,
 };
-use crate::dom::bindings::error::ErrorResult;
+use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
@@ -878,6 +878,22 @@ impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage>
     fn ValidationMessage(&self, cx: &mut JSContext) -> DOMString {
         self.validation_message(cx)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-select-showpicker>
+    fn ShowPicker(&self, cx: &mut JSContext) -> ErrorResult {
+        if self.upcast::<Element>().disabled_state() {
+            return Err(Error::InvalidState(Some(
+                "Select element is disabled".into(),
+            )));
+        }
+        if !self.owner_window().has_transient_activation() {
+            return Err(Error::NotAllowed(Some(
+                "HTMLSelectElement.showPicker() requires user activation".into(),
+            )));
+        }
+        self.show_menu(cx);
+        Ok(())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-setcustomvalidity>

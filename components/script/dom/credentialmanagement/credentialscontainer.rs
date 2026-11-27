@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use dom_struct::dom_struct;
 use js::context::JSContext;
+use js::jsval::UndefinedValue;
 use js::realm::CurrentRealm;
+use script_bindings::codegen::GenericBindings::AbortSignalBinding::AbortSignalMethods;
 use script_bindings::codegen::GenericBindings::CredentialsContainerBinding::{
     CredentialCreationOptions, CredentialRequestOptions,
 };
@@ -13,6 +15,7 @@ use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::CredentialsContainerBinding::CredentialsContainerMethods;
 use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::credentialmanagement::credential::Credential;
 use crate::dom::globalscope::GlobalScope;
@@ -49,13 +52,19 @@ impl CredentialsContainer {
 
         let promise = Promise::new_in_realm(cx);
         // Step 4. If document is not fully active, then return a promise rejected with an "InvalidStateError" DOMException.
-        if !document.is_fully_active() {
+        if !self.global().as_window().Document().is_fully_active() || !document.is_fully_active() {
             promise.reject_error(cx, Error::InvalidState(None));
             return Ok(promise);
         }
         // Step 5. If options.signal is aborted, then return a promise rejected with options.signal’s abort reason.
-        if options.signal.as_ref().is_some_and(|s| s.aborted()) {
-            promise.reject_error(cx, Error::Abort(None));
+        if let Some(signal) = options.signal.as_ref().filter(|s| s.aborted()) {
+            rooted!(&in(cx) let mut reason = UndefinedValue());
+            signal.Reason(reason.handle_mut());
+            promise.reject(cx, reason.handle());
+            return Ok(promise);
+        }
+        if options.publicKey.is_some() {
+            promise.reject_error(cx, Error::NotAllowed(None));
             return Ok(promise);
         }
         promise.reject_error(cx, Error::NotSupported(None));
@@ -75,7 +84,9 @@ impl CredentialsContainer {
 
         let promise = Promise::new_in_realm(cx);
         // Step 3. If settings’s relevant global object's associated Document is not fully active, then return a promise rejected with an "InvalidStateError" DOMException.
-        if !global.as_window().Document().is_fully_active() {
+        if !self.global().as_window().Document().is_fully_active() ||
+            !global.as_window().Document().is_fully_active()
+        {
             promise.reject_error(cx, Error::InvalidState(None));
             return Ok(promise);
         }
@@ -87,7 +98,7 @@ impl CredentialsContainer {
     fn create_credential(
         &self,
         cx: &mut CurrentRealm,
-        _options: &CredentialCreationOptions<DomTypeHolder>,
+        options: &CredentialCreationOptions<DomTypeHolder>,
     ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
@@ -99,8 +110,19 @@ impl CredentialsContainer {
 
         let promise = Promise::new_in_realm(cx);
         // Step 5. If document is not fully active, then return a promise rejected with an "InvalidStateError" DOMException.
-        if !document.is_fully_active() {
+        if !self.global().as_window().Document().is_fully_active() || !document.is_fully_active() {
             promise.reject_error(cx, Error::InvalidState(None));
+            return Ok(promise);
+        }
+        // Step 6. If options.signal is aborted, then return a promise rejected with options.signal’s abort reason.
+        if let Some(signal) = options.signal.as_ref().filter(|s| s.aborted()) {
+            rooted!(&in(cx) let mut reason = UndefinedValue());
+            signal.Reason(reason.handle_mut());
+            promise.reject(cx, reason.handle());
+            return Ok(promise);
+        }
+        if options.publicKey.is_some() {
+            promise.reject_error(cx, Error::NotAllowed(None));
             return Ok(promise);
         }
         promise.reject_error(cx, Error::NotSupported(None));
@@ -134,8 +156,18 @@ impl CredentialsContainerMethods<DomTypeHolder> for CredentialsContainer {
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credentialscontainer-preventsilentaccess>
     fn PreventSilentAccess(&self, cx: &mut CurrentRealm) -> Fallible<RootedPromise> {
+        let global = GlobalScope::from_current_realm(cx);
+        assert!(global.is_secure_context());
+
         let promise = Promise::new_in_realm(cx);
-        promise.reject_error(cx, Error::NotSupported(None));
+        if !self.global().as_window().Document().is_fully_active() ||
+            !global.as_window().Document().is_fully_active()
+        {
+            promise.reject_error(cx, Error::InvalidState(None));
+            return Ok(promise);
+        }
+
+        promise.resolve_native(cx, &());
         Ok(promise)
     }
 }

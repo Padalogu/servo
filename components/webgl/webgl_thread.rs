@@ -318,10 +318,17 @@ impl WebGLThread {
 
     fn process(&mut self) {
         let webgl_chan = WebGLChan(self.sender.clone());
-        while let Ok(Ok(msg)) = self.receiver.recv() {
-            let exit = self.handle_msg(msg, &webgl_chan);
-            if exit {
-                break;
+        loop {
+            match self.receiver.recv() {
+                Ok(Ok(msg)) => {
+                    if self.handle_msg(msg, &webgl_chan) {
+                        break;
+                    }
+                }
+                Ok(Err(err)) => {
+                    log::warn!("WebGLThread ignoring routed IPC error: {err:?}");
+                }
+                Err(_) => break,
             }
         }
     }

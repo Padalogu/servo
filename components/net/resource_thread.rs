@@ -227,6 +227,7 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy: embedder_proxy.clone(),
+        host_gates: Default::default(),
     };
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -244,6 +245,7 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy,
+        host_gates: Default::default(),
     };
 
     (Arc::new(http_state), Arc::new(private_http_state))

@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use embedder_traits::ViewportDetails;
-use log::warn;
+use log::{debug, warn};
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 
@@ -136,7 +136,7 @@ impl<'a> Iterator for FullyActiveBrowsingContextsIterator<'a> {
             let browsing_context = match self.browsing_contexts.get(&browsing_context_id) {
                 Some(browsing_context) => browsing_context,
                 None => {
-                    warn!(
+                    debug!(
                         "BrowsingContext {:?} iterated after closure.",
                         browsing_context_id
                     );
@@ -146,7 +146,7 @@ impl<'a> Iterator for FullyActiveBrowsingContextsIterator<'a> {
             let pipeline = match self.pipelines.get(&browsing_context.pipeline_id) {
                 Some(pipeline) => pipeline,
                 None => {
-                    warn!(
+                    debug!(
                         "Pipeline {:?} iterated after closure.",
                         browsing_context.pipeline_id
                     );

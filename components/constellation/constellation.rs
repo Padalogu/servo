@@ -1126,7 +1126,14 @@ where
     ) {
         debug!("{browsing_context_id}: Creating new browsing context");
         let Some(webview) = self.webviews.get_mut(&webview_id) else {
-            println!("Adding BrowsingContext for unknown WebView: {webview_id:?}");
+            warn!("Adding BrowsingContext for unknown WebView: {webview_id:?}");
+            if self.pipelines.contains_key(&pipeline_id) {
+                self.close_pipeline(
+                    pipeline_id,
+                    DiscardBrowsingContext::Yes,
+                    ExitPipelineMode::Normal,
+                );
+            }
             return;
         };
 
@@ -3693,6 +3700,11 @@ where
             });
         } else {
             warn!("Could not find WebView for new iframe: ({webview_id:?})");
+            self.close_pipeline(
+                new_pipeline_id,
+                DiscardBrowsingContext::Yes,
+                ExitPipelineMode::Normal,
+            );
         }
     }
 
@@ -4047,6 +4059,9 @@ where
         let mut animating_workers = FxHashSet::default();
 
         for webview_id in webview_ids.iter() {
+            if !self.webviews.contains_key(webview_id) {
+                continue;
+            }
             for browsing_context in self.fully_active_browsing_contexts_iter(*webview_id) {
                 let Some(pipeline) = self.pipelines.get(&browsing_context.pipeline_id) else {
                     continue;
@@ -5227,6 +5242,40 @@ where
         webview_id: WebViewId,
         browsing_context_id: BrowsingContextId,
     ) -> Vec<PipelineId> {
+        if !self.browsing_contexts.contains_key(&browsing_context_id) {
+            let pending_pipeline_ids: Vec<PipelineId> = self
+                .webviews
+                .get_mut(&webview_id)
+                .map(|webview| {
+                    webview.take_pending_viewport_details(&browsing_context_id);
+                    webview
+                        .remove_pending_changes_for_browsing_context_id(browsing_context_id)
+                        .into_iter()
+                        .map(|change| change.new_pipeline_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for &pipeline_id in &pending_pipeline_ids {
+                if self.pipelines.contains_key(&pipeline_id) {
+                    self.close_pipeline(
+                        pipeline_id,
+                        DiscardBrowsingContext::Yes,
+                        ExitPipelineMode::Normal,
+                    );
+                }
+            }
+            if !pending_pipeline_ids.is_empty()
+                && let Some(webview) = self.webviews.get_mut(&webview_id)
+            {
+                webview.send_screenshot_readiness_requests_to_pipelines(
+                    &self.browsing_contexts,
+                    &self.pipelines,
+                );
+            }
+            return pending_pipeline_ids;
+        }
+
         let result = self
             .all_descendant_browsing_contexts_iter(browsing_context_id)
             .flat_map(|browsing_context| browsing_context.pipelines.iter().cloned())

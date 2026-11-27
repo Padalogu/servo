@@ -202,7 +202,11 @@ bitflags! {
         /// animating image. This flag is never cleared once it is set.
         const HAS_EVER_ANIMATED = 1 << 3;
 
-        // There are two free bits here.
+        /// Specifies whether this node has descendants with pending box tree / layout damage
+        /// deferred by a previous style-only reflow.
+        const HAS_DIRTY_LAYOUT_DESCENDANTS = 1 << 4;
+
+        // There is one free bit here.
 
         /// Specifies whether the parser has set an associated form owner for
         /// this element. Only applicable for form-associatable elements.

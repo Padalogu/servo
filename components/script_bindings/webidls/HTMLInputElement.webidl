@@ -92,6 +92,7 @@ interface HTMLInputElement : HTMLElement {
   readonly attribute NodeList? labels;
 
   undefined select();
+  [Throws] undefined showPicker();
   [SetterThrows]
            attribute unsigned long? selectionStart;
   [SetterThrows]

@@ -111,7 +111,7 @@ use webrender_api::ExternalScrollId;
 use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint};
 
 use crate::dom::StatelessWorkletThreadPool;
-use crate::dom::bindings::callback::RootedCallback;
+use crate::dom::bindings::callback::{ExceptionHandling, RootedCallback, TracedCallback};
 use crate::dom::bindings::codegen::Bindings::AnimationFrameProviderBinding::FrameRequestCallback;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState, NamedPropertyValue,
@@ -127,8 +127,8 @@ use crate::dom::bindings::codegen::Bindings::ReportingObserverBinding::Report;
 use crate::dom::bindings::codegen::Bindings::RequestBinding::{RequestInfo, RequestInit};
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::{
-    self, DeferredRequestInit, ScrollBehavior, ScrollToOptions, WindowMethods,
-    WindowPostMessageOptions,
+    self, DeferredRequestInit, IdleRequestCallback, IdleRequestOptions, ScrollBehavior,
+    ScrollToOptions, WindowMethods, WindowPostMessageOptions,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     RequestOrUSVString, TrustedScriptOrString, TrustedScriptOrStringOrFunction,
@@ -193,6 +193,7 @@ use crate::dom::types::{FontFace, ImageBitmap, SVGSVGElement, UIEvent};
 use crate::dom::visualviewport::{VisualViewport, VisualViewportChanges};
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
+use crate::dom::window::idledeadline::{IdleCallbackTimeoutCallback, IdleDeadline};
 use crate::dom::window::layout_image::fetch_image_for_layout;
 use crate::dom::window::screen::Screen;
 use crate::dom::window::scrolling_box::{ScrollingBox, ScrollingBoxSource};
@@ -202,7 +203,9 @@ use crate::dom::worklet::Worklet;
 use crate::dom::workletglobalscope::WorkletGlobalScopeType;
 use crate::event_loop::script_thread::ScriptThread;
 use crate::event_loop::script_window_proxies::ScriptWindowProxies;
-use crate::event_loop::timers::{IsInterval, OneshotTimers, TimerCallback};
+use crate::event_loop::timers::{
+    IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
+};
 use crate::event_loop::webdriver_handlers::find_node_by_unique_id_in_document;
 use crate::fetch::fetch;
 use crate::fetch::network_listener::{ResourceTimingListener, submit_timing};
@@ -521,9 +524,47 @@ pub(crate) struct Window {
 
     /// <https://html.spec.whatwg.org/multipage/#close-watcher-manager>
     close_watcher_manager: CloseWatcherManager,
+
+    /// Active `requestIdleCallback()` handles and callbacks.
+    next_idle_callback_id: Cell<u32>,
+    idle_callbacks: DomRefCell<Vec<(u32, PendingIdleCallback)>>,
 }
 
+#[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+struct PendingIdleCallback {
+    callback: TracedCallback<IdleRequestCallback>,
+    timer_handle: OneshotTimerHandle,
+    timeout_deadline: Option<Instant>,
+}
+
+impl js::gc::Rootable for PendingIdleCallback {}
+
 impl Window {
+    pub(crate) fn run_idle_callback(&self, cx: &mut JSContext, handle: u32) {
+        rooted!(&in(cx) let entry = {
+            let mut callbacks = self.idle_callbacks.borrow_mut();
+            callbacks
+                .iter()
+                .position(|(id, _)| *id == handle)
+                .map(|pos| callbacks.remove(pos).1)
+        });
+        let Some(ref entry) = *entry else {
+            return;
+        };
+        let now = Instant::now();
+        let did_timeout = entry.timeout_deadline.is_some_and(|dl| now >= dl);
+        let deadline = IdleDeadline::new(
+            cx,
+            self.as_global_scope(),
+            did_timeout,
+            now + Duration::from_millis(50),
+        );
+        let _ = entry
+            .callback
+            .Call__(cx, &deadline, ExceptionHandling::Report);
+    }
+
     pub(crate) fn script_thread(&self) -> Rc<ScriptThread> {
         Weak::upgrade(&self.weak_script_thread)
             .expect("Weak reference should always be upgradable when a ScriptThread is running")
@@ -1083,6 +1124,7 @@ impl Window {
         }
     }
 
+    #[allow(dead_code)]
     #[expect(unsafe_code)]
     pub(crate) fn gc(&self, cx: &mut JSContext) {
         unsafe { JS_GC(cx, GCReason::API) };
@@ -1926,6 +1968,48 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         Ok(())
     }
 
+    /// <https://w3c.github.io/requestidlecallback/#dom-window-requestidlecallback>
+    fn RequestIdleCallback(
+        &self,
+        _cx: &mut JSContext,
+        callback: RootedCallback<IdleRequestCallback>,
+        options: &IdleRequestOptions,
+    ) -> u32 {
+        let ident = self.next_idle_callback_id.get().wrapping_add(1).max(1);
+        self.next_idle_callback_id.set(ident);
+        let timeout_deadline = options
+            .timeout
+            .map(|ms| Instant::now() + Duration::from_millis(u64::from(ms)));
+        let delay = Duration::from_millis(1);
+        let timer_handle = self.as_global_scope().schedule_callback(
+            OneshotTimerCallback::IdleCallbackTimeout(IdleCallbackTimeoutCallback {
+                window: Trusted::new(self),
+                handle: ident,
+            }),
+            delay,
+        );
+        self.idle_callbacks.borrow_mut().push((
+            ident,
+            PendingIdleCallback {
+                callback: callback.to_traced(),
+                timer_handle,
+                timeout_deadline,
+            },
+        ));
+        ident
+    }
+
+    /// <https://w3c.github.io/requestidlecallback/#dom-window-cancelidlecallback>
+    fn CancelIdleCallback(&self, handle: u32) {
+        let mut callbacks = self.idle_callbacks.borrow_mut();
+        if let Some(pos) = callbacks.iter().position(|(id, _)| *id == handle) {
+            let (_, entry) = callbacks.remove(pos);
+            drop(callbacks);
+            self.as_global_scope()
+                .unschedule_callback(entry.timer_handle);
+        }
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-window-postmessage>
     fn PostMessage(
         &self,
@@ -2674,6 +2758,7 @@ impl Window {
         // Step 7.1. If the scroll position changed as a result of this call, emit the
         // scrollend event.
         if reflow_phases_run.contains(ReflowPhasesRun::UpdatedScrollNodeOffset) {
+            self.Document().focus_handler().note_scroll();
             match element {
                 Some(element) if !scroll_id.is_root() => element.handle_scroll_event(),
                 _ => self.Document().handle_viewport_scroll_event(),
@@ -2698,6 +2783,7 @@ impl Window {
 
     /// Prepares to tick animations and then does a reflow which also advances the
     /// layout animation clock.
+    #[allow(dead_code)]
     pub(crate) fn advance_animation_clock(&self, no_gc: &NoGC, delta: TimeDuration) {
         self.Document()
             .advance_animation_timeline_for_testing(delta);
@@ -2756,6 +2842,10 @@ impl Window {
             None
         };
 
+        if reflow_goal.needs_layout() {
+            document.flush_pending_input_shadow_trees(cx);
+        }
+
         if let Some(selection) = document.selection() {
             selection.update_overlaps_document_selection_flags(cx.no_gc());
         }
@@ -2782,7 +2872,9 @@ impl Window {
             let pending_restyles = document.drain_pending_restyles(cx.no_gc());
             let dirty_root = document
                 .take_dirty_root()
-                .filter(|_| !stylesheets_changed)
+                .filter(|_| {
+                    !stylesheets_changed && !restyle_reason.contains(RestyleReason::ViewportChanged)
+                })
                 .or_else(|| document.GetDocumentElement())
                 .map(|root| root.upcast::<Node>().to_trusted_node_address());
 
@@ -3242,18 +3334,65 @@ impl Window {
         self.perform_a_scroll(cx, x, y, scroll_id, behavior, Some(element));
     }
 
+    fn ancestor_window_needs_restyle(&self) -> bool {
+        let mut current_parent = self.parent_info;
+        while let Some(parent_pipeline_id) = current_parent {
+            let Some(parent_window) = ScriptThread::find_window(parent_pipeline_id) else {
+                return true;
+            };
+            let parent_doc = parent_window.Document();
+            if parent_doc.has_any_restyle_reason() ||
+                parent_doc.has_pending_restyles() ||
+                parent_doc.has_global_restyle_reason()
+            {
+                return true;
+            }
+            current_parent = parent_window.parent_info;
+        }
+        false
+    }
+
+    pub(crate) fn can_skip_reflow_for_style(&self, element: &Element) -> bool {
+        if !element.upcast::<Node>().is_connected() {
+            return false;
+        }
+        if !self.layout.borrow().can_serve_cached_resolved_style() {
+            return false;
+        }
+        if self.ancestor_window_needs_restyle() {
+            return false;
+        }
+        self.Document()
+            .can_serve_cached_resolved_style_for_element(element)
+    }
+
+    fn can_skip_reflow_for_resolved_style(
+        &self,
+        element: &Element,
+        pseudo: &Option<PseudoElement>,
+        property: &PropertyId,
+    ) -> bool {
+        if pseudo.is_some() || QueryMsg::resolved_style_needs_layout(property) {
+            return false;
+        }
+        self.can_skip_reflow_for_style(element)
+    }
+
     pub(crate) fn resolved_style_query(
         &self,
-        element: TrustedNodeAddress,
+        element: &Element,
         pseudo: Option<PseudoElement>,
         property: PropertyId,
     ) -> DOMString {
-        self.layout_reflow_deprecated(QueryMsg::ResolvedStyleQuery(property.clone()));
+        if !self.can_skip_reflow_for_resolved_style(element, &pseudo, &property) {
+            self.layout_reflow_deprecated(QueryMsg::ResolvedStyleQuery(property.clone()));
+        }
 
+        let addr = element.upcast::<Node>().to_trusted_node_address();
         let document = self.Document();
         let animations = document.animation_manager().sets();
         DOMString::from(self.layout.borrow().query_resolved_style(
-            element,
+            addr,
             pseudo,
             property,
             animations,
@@ -3766,11 +3905,20 @@ impl Window {
 
     /// Set whether to use less resources by running timers at a heavily limited rate.
     pub(crate) fn set_throttled(&self, throttled: bool) {
+        if self.throttled.get() == throttled {
+            return;
+        }
         self.throttled.set(throttled);
         if throttled {
             self.as_global_scope().slow_down_timers();
+            if let Some(document) = self.document.get() {
+                document.pause_throttled_media_elements();
+            }
         } else {
             self.as_global_scope().speed_up_timers();
+            if let Some(document) = self.document.get() {
+                document.resume_throttled_media_elements();
+            }
         }
     }
 
@@ -3992,8 +4140,9 @@ impl Window {
         for node in pending_svg_element_for_serialization.into_iter() {
             let node = unsafe { from_untrusted_node_address(node) };
             let svg = node.downcast::<SVGSVGElement>().unwrap();
-            svg.serialize_and_cache_subtree(cx);
-            node.dirty(cx.no_gc(), NodeDamage::Other);
+            if svg.serialize_and_cache_subtree(cx) {
+                node.dirty(cx.no_gc(), NodeDamage::Other);
+            }
         }
     }
 
@@ -4249,6 +4398,8 @@ impl Window {
                 UserActivationTimestamp::PositiveInfinity,
             ),
             close_watcher_manager: CloseWatcherManager::new(),
+            next_idle_callback_id: Cell::new(0),
+            idle_callbacks: DomRefCell::new(Vec::new()),
         });
 
         WindowBinding::Wrap::<crate::DomTypeHolder>(cx, &origin, win)
@@ -4450,8 +4601,8 @@ impl ParseErrorReporter for CSSErrorReporter {
         location: SourceLocation,
         error: ContextualParseError,
     ) {
-        if log_enabled!(log::Level::Info) {
-            info!(
+        if log_enabled!(log::Level::Debug) {
+            log::debug!(
                 "Url:\t{}\n{}:{} {}",
                 url.0.as_str(),
                 location.line,

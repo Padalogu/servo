@@ -620,3 +620,67 @@ fn test_delete_cookie_with_name_does_not_affect_other_domains() {
         Some("foo=bar")
     );
 }
+
+#[test]
+fn test_samesite_none_and_partitioned_require_secure_and_roundtrip() {
+    let https_url = ServoUrl::parse("https://example.com/").unwrap();
+    let http_url = ServoUrl::parse("http://example.com/").unwrap();
+
+    // SameSite=None without Secure is rejected even on HTTPS.
+    assert!(
+        ServoCookie::from_cookie_string("ss=1; SameSite=None", &https_url, CookieSource::HTTP)
+            .is_none()
+    );
+    // SameSite=None; Secure on HTTP is rejected.
+    assert!(
+        ServoCookie::from_cookie_string(
+            "ss=1; SameSite=None; Secure",
+            &http_url,
+            CookieSource::HTTP
+        )
+        .is_none()
+    );
+
+    // Partitioned without Secure is rejected even on HTTPS.
+    assert!(
+        ServoCookie::from_cookie_string("chip=1; Partitioned", &https_url, CookieSource::HTTP)
+            .is_none()
+    );
+    // Partitioned; Secure on HTTP is rejected.
+    assert!(
+        ServoCookie::from_cookie_string(
+            "chip=1; Partitioned; Secure",
+            &http_url,
+            CookieSource::HTTP
+        )
+        .is_none()
+    );
+
+    // SameSite=None; Partitioned; Secure on HTTPS is accepted.
+    let wrapped = ServoCookie::from_cookie_string(
+        "sid=abc; Secure; SameSite=None; Partitioned; Path=/",
+        &https_url,
+        CookieSource::HTTP,
+    )
+    .expect("valid SameSite=None Partitioned Secure cookie");
+    assert_eq!(wrapped.cookie.same_site(), Some(cookie::SameSite::None));
+    assert_eq!(wrapped.cookie.partitioned(), Some(true));
+
+    // Verify CookieStorage + JSON persistence roundtrip preserves same_site and partitioned.
+    let mut storage = CookieStorage::new(10);
+    storage.push(wrapped, &https_url, CookieSource::HTTP);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    servo_base::write_json_to_file(&storage, dir.path(), "cookie_jar.json");
+    let mut reloaded = CookieStorage::new(10);
+    servo_base::read_json_from_file(&mut reloaded, dir.path(), "cookie_jar.json");
+
+    let cookies: Vec<_> = reloaded
+        .cookies_data_for_url(&https_url, CookieSource::HTTP)
+        .collect();
+    assert_eq!(cookies.len(), 1);
+    assert_eq!(cookies[0].name(), "sid");
+    assert_eq!(cookies[0].value(), "abc");
+    assert_eq!(cookies[0].same_site(), Some(cookie::SameSite::None));
+    assert_eq!(cookies[0].partitioned(), Some(true));
+}

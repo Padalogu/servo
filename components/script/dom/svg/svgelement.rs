@@ -4,10 +4,8 @@
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
-use script_bindings::codegen::GenericBindings::ElementBinding::ScrollLogicalPosition;
-use script_bindings::codegen::GenericBindings::WindowBinding::ScrollBehavior;
 use script_bindings::str::DOMString;
 use style::attr::AttrValue;
 use style::parser::ParserContext;
@@ -27,23 +25,28 @@ use crate::dom::css::cssstyledeclaration::{
 };
 use crate::dom::document::Document;
 use crate::dom::document::focus::FocusableArea;
+use crate::dom::domstringmap::DOMStringMap;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
-use crate::dom::node::focus::FocusTrigger;
+use crate::dom::iterators::ShadowIncluding;
+use crate::dom::node::focus::{FocusOutcome, FocusTrigger};
 use crate::dom::node::virtualmethods::VirtualMethods;
-use crate::dom::node::{Node, NodeTraits};
+use crate::dom::node::{ChildrenMutation, Node, NodeTraits};
+use crate::dom::svg::svganimatedstring::SVGAnimatedString;
 use crate::dom::svg::svgcircleelement::SVGCircleElement;
 use crate::dom::svg::svgellipseelement::SVGEllipseElement;
 use crate::dom::svg::svgimageelement::SVGImageElement;
 use crate::dom::svg::svgpathelement::SVGPathElement;
 use crate::dom::svg::svgrectelement::SVGRectElement;
 use crate::dom::svg::svgsvgelement::SVGSVGElement;
-use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollRequirement};
+use crate::dom::svg::svgsymbolelement::SVGSymbolElement;
 
 #[dom_struct]
 pub(crate) struct SVGElement {
     element: Element,
     style_decl: MutNullableDom<CSSStyleDeclaration>,
+    dataset: MutNullableDom<DOMStringMap>,
+    class_name: MutNullableDom<SVGAnimatedString>,
 }
 
 impl SVGElement {
@@ -64,6 +67,8 @@ impl SVGElement {
         SVGElement {
             element: Element::new_inherited_with_state(state, tag_name, ns!(svg), prefix, document),
             style_decl: Default::default(),
+            dataset: Default::default(),
+            class_name: Default::default(),
         }
     }
 
@@ -84,6 +89,17 @@ impl SVGElement {
 
     fn as_element(&self) -> &Element {
         self.upcast::<Element>()
+    }
+
+    fn invalidate_enclosing_svgs(&self, no_gc: &NoGC) {
+        for ancestor in self
+            .upcast::<Node>()
+            .inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No)
+        {
+            if let Some(svg) = ancestor.downcast::<SVGSVGElement>() {
+                svg.mark_subtree_dirty(no_gc);
+            }
+        }
     }
 }
 
@@ -113,6 +129,14 @@ impl VirtualMethods for SVGElement {
                 },
             }
         }
+        self.invalidate_enclosing_svgs(cx.no_gc());
+    }
+
+    fn children_changed(&self, cx: &mut JSContext, mutation: &ChildrenMutation) {
+        if let Some(super_type) = self.super_type() {
+            super_type.children_changed(cx, mutation);
+        }
+        self.invalidate_enclosing_svgs(cx.no_gc());
     }
 
     fn attribute_affects_presentational_hints(&self, attr: AttrRef<'_>) -> bool {
@@ -150,6 +174,36 @@ impl VirtualMethods for SVGElement {
 }
 
 impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
+    /// <https://svgwg.org/svg2-draft/types.html#__svg__SVGElement__className>
+    fn ClassName(&self, cx: &mut JSContext) -> DomRoot<SVGAnimatedString> {
+        self.class_name
+            .or_init(|| SVGAnimatedString::new(cx, self.as_element()))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-dataset>
+    fn Dataset(&self, cx: &mut JSContext) -> DomRoot<DOMStringMap> {
+        self.dataset
+            .or_init(|| DOMStringMap::new(cx, self.as_element()))
+    }
+
+    /// <https://svgwg.org/svg2-draft/types.html#__svg__SVGElement__ownerSVGElement>
+    fn GetOwnerSVGElement(&self) -> Option<DomRoot<SVGSVGElement>> {
+        self.upcast::<Node>()
+            .ancestors()
+            .find_map(|ancestor| ancestor.downcast::<SVGSVGElement>().map(DomRoot::from_ref))
+    }
+
+    /// <https://svgwg.org/svg2-draft/types.html#__svg__SVGElement__viewportElement>
+    fn GetViewportElement(&self) -> Option<DomRoot<SVGElement>> {
+        self.upcast::<Node>().ancestors().find_map(|ancestor| {
+            if ancestor.is::<SVGSVGElement>() || ancestor.is::<SVGSymbolElement>() {
+                ancestor.downcast::<SVGElement>().map(DomRoot::from_ref)
+            } else {
+                None
+            }
+        })
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#the-style-attribute>
     fn Style(&self, cx: &mut JSContext) -> DomRoot<CSSStyleDeclaration> {
         self.style_decl.or_init(|| {
@@ -195,10 +249,12 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
         // TODO: Implement this.
 
         // 2. Run the focusing steps for this.
-        if !self
-            .upcast::<Node>()
-            .run_the_focusing_steps(cx, None, FocusTrigger::Script)
-        {
+        let outcome = self.upcast::<Node>().run_the_focusing_steps_with_outcome(
+            cx,
+            None,
+            FocusTrigger::Script,
+        );
+        if outcome == FocusOutcome::NotFocusable {
             // The specification seems to imply we should scroll into view even if this element
             // is not a focusable area. No browser does this, so we return early in that case.
             // See https://github.com/whatwg/html/issues/12231.
@@ -213,18 +269,9 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
         // > 4. If options["preventScroll"] is false, then scroll a target into view given this,
         // >    "auto", "center", and "center".
         if !options.preventScroll {
-            let scroll_axis = ScrollAxisState {
-                position: ScrollLogicalPosition::Center,
-                requirement: ScrollRequirement::IfNotVisible,
-            };
-            self.upcast::<Element>().scroll_into_view_with_options(
-                cx,
-                ScrollBehavior::Smooth,
-                scroll_axis,
-                scroll_axis,
-                None,
-                None,
-            );
+            self.owner_document()
+                .focus_handler()
+                .scroll_element_into_view_if_needed(cx, self.upcast::<Element>(), outcome);
         }
     }
 
